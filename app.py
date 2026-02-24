@@ -21,7 +21,8 @@ st.set_page_config(
 # ── Import scorer ─────────────────────────────────────────────────────────────
 from scorer import (
     fetch_and_score, fetch_and_score_batch, backtest_ticker,
-    run_scenario, optimize_strategy, WEIGHTS, DATA_POINT_LABELS, _signal_label,
+    run_scenario, optimize_strategy, fetch_diagnostics,
+    WEIGHTS, DATA_POINT_LABELS, _signal_label,
 )
 
 # ── Index ticker lists ────────────────────────────────────────────────────────
@@ -159,7 +160,7 @@ with st.sidebar:
     st.divider()
     page = st.radio(
         "Navigate",
-        ["◎  Evaluator", "⊞  Screener", "↺  Backtest", "⚙  Optimizer", "⬡  Methodology"],
+        ["◎  Evaluator", "⊞  Screener", "↺  Backtest", "⚙  Optimizer", "⬡  Methodology", "🔬  Diagnostics"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -801,6 +802,105 @@ fundamentals like revenue growth, FCF yield, and EPS growth.
 """)
 
 # ── Footer ────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 6 — DIAGNOSTICS
+# ══════════════════════════════════════════════════════════════════════════════
+
+if page == "Diagnostics":
+    st.markdown('<div class="section-title">Data Diagnostics</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-sub">TEST WHAT YAHOO FINANCE IS ACTUALLY RETURNING</div>', unsafe_allow_html=True)
+
+    st.info("""
+Use this page if scores are showing as 50 across the board. It shows exactly what
+data Yahoo Finance returned for a ticker — so you can see whether the problem is
+a rate limit, a bad ticker, or missing fields.
+""")
+
+    diag_ticker = st.text_input("Ticker to diagnose", value="AAPL")
+    run_diag    = st.button("🔬 Run Diagnostics", type="primary")
+
+    if run_diag:
+        with st.spinner(f"Fetching raw data for {diag_ticker.upper()}…"):
+            d = fetch_diagnostics(diag_ticker.upper())
+
+        st.divider()
+
+        # Status indicators
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Info Keys Returned",  d["info_keys_returned"])
+        c2.metric("Price History Rows",  d["hist_rows"])
+        c3.metric("Fetch Failed?",       "❌ YES" if d["info_fetch_failed"] else "✅ NO")
+        c4.metric("Using Fallback Data?", "⚠️ YES" if d["info_is_fallback"] else "✅ NO")
+
+        if d["info_fetch_failed"] or d["info_keys_returned"] < 5:
+            st.error("""
+**Yahoo Finance returned no/empty data.** This is the root cause of all-50 scores.
+
+Common causes:
+- **Rate limiting**: Too many requests in a short window. Wait 30–60 seconds and try again.
+- **Invalid ticker**: Check the ticker symbol is correct (e.g. `BRK-B` not `BRK.B`)
+- **Yahoo Finance outage**: Try again in a few minutes
+- **Streamlit Cloud IP blocked**: Yahoo occasionally blocks cloud server IPs
+
+**Immediate workaround**: Try scoring 1–2 tickers manually in the Evaluator tab first,
+then run the screener. This "warms up" the connection.
+""")
+        elif d["info_is_fallback"]:
+            st.warning("⚠️ Using fallback data (fast_info only). Fundamental scores will be limited — technical scores should still work.")
+        else:
+            st.success(f"✅ Data fetched successfully. {d['info_keys_returned']} info fields returned.")
+
+        # Key fields table
+        st.markdown("#### Key Fields Retrieved")
+        fields = {
+            "Company Name":        d["shortName"],
+            "Sector":              d["sector"],
+            "Current Price":       d["price"],
+            "Trailing P/E":        d["trailingPE"],
+            "Forward P/E":         d["forwardPE"],
+            "Revenue Growth":      f"{round(d['revenueGrowth']*100,1)}%" if d["revenueGrowth"] else "❌ Missing",
+            "Profit Margin":       f"{round(d['profitMargins']*100,1)}%" if d["profitMargins"] else "❌ Missing",
+            "Analyst Rec. Mean":   d["recommendationMean"],
+            "Analyst Price Target":d["targetMeanPrice"],
+            "Trailing EPS":        d["trailingEps"],
+            "Free Cash Flow":      f"${d['freeCashflow']:,.0f}" if d["freeCashflow"] else "❌ Missing",
+            "Short % Float":       f"{round(d['shortPercentOfFloat']*100,1)}%" if d["shortPercentOfFloat"] else "❌ Missing",
+            "Price History Rows":  d["hist_rows"],
+            "Latest Price Date":   d["hist_latest"],
+        }
+        df_diag = pd.DataFrame(fields.items(), columns=["Field", "Value"])
+        st.dataframe(df_diag, hide_index=True, use_container_width=True)
+
+        # Also run a live score to show what happens
+        st.divider()
+        st.markdown("#### Live Score (using data above)")
+        with st.spinner("Scoring…"):
+            r = fetch_and_score(diag_ticker.upper(), "1M")
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Final Score",  r["overall"])
+        col2.metric("Raw Score",    r.get("raw_score", "—"))
+        col3.metric("Confidence %", r["confidence"])
+
+        if r["overall"] == 50 and r["confidence"] == 0:
+            st.error("Score is 50 with 0% confidence — data is not loading. See diagnostic above.")
+        elif r["confidence"] < 40:
+            st.warning(f"Low confidence ({r['confidence']}%) — many fields missing. Scores will be approximate.")
+        else:
+            st.success(f"Score looks valid. {r['confidence']}% of data fields populated.")
+
+        if r.get("data_scores"):
+            st.markdown("**Individual data point scores:**")
+            dp_df = pd.DataFrame([
+                {"Data Point": DATA_POINT_LABELS.get(k, k), "Score": v,
+                 "Status": "🟢" if v > 60 else ("🔴" if v < 40 else "🟡")}
+                for k, v in r["data_scores"].items()
+            ]).sort_values("Score", ascending=False)
+            st.dataframe(dp_df, hide_index=True, use_container_width=True,
+                         column_config={"Score": st.column_config.ProgressColumn(
+                             "Score", min_value=0, max_value=100, format="%d")})
+
 st.markdown("""
 <div class="disclaimer">
 ALPHAIQ · DATA VIA YAHOO FINANCE · FOR EDUCATIONAL PURPOSES ONLY · NOT FINANCIAL ADVICE<br>
