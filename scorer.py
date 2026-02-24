@@ -1362,3 +1362,20 @@ def predict_market_next_day(index_key: str = "S&P 500") -> dict:
         "timestamp": res.get("timestamp"),
         "error": None,
     }
+
+# Calibrated score → confidence (example numbers)
+SCORE_CONFIDENCE_MAP = [
+    (80, 100, 78),
+    (70, 79, 66),
+    (60, 69, 58),
+    (55, 59, 53),
+    (45, 54, 48),
+    (30, 44, 41),
+    (0, 29, 37),
+]
+
+def calibrated_confidence(score: int) -> int:
+    for low, high, conf in SCORE_CONFIDENCE_MAP:
+        if low <= score <= high:
+            return conf
+    return 50
