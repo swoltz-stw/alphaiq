@@ -21,7 +21,7 @@ st.set_page_config(
 # ── Import scorer ─────────────────────────────────────────────────────────────
 from scorer import (
     fetch_and_score, fetch_and_score_batch, backtest_ticker,
-    run_scenario, WEIGHTS, DATA_POINT_LABELS, _signal_label,
+    run_scenario, optimize_strategy, WEIGHTS, DATA_POINT_LABELS, _signal_label,
 )
 
 # ── Index ticker lists ────────────────────────────────────────────────────────
@@ -159,7 +159,7 @@ with st.sidebar:
     st.divider()
     page = st.radio(
         "Navigate",
-        ["◎  Evaluator", "⊞  Screener", "↺  Backtest", "⬡  Methodology"],
+        ["◎  Evaluator", "⊞  Screener", "↺  Backtest", "⚙  Optimizer", "⬡  Methodology"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -536,10 +536,151 @@ elif page == "Backtest":
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 4 — METHODOLOGY
+# PAGE 4 — OPTIMIZER
 # ══════════════════════════════════════════════════════════════════════════════
 
-elif page == "Methodology":
+elif page == "Optimizer":
+    st.markdown('<div class="section-title">Strategy Optimizer</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-sub">FIND OPTIMAL BUY/SELL THRESHOLDS · WALK-FORWARD VALIDATED</div>', unsafe_allow_html=True)
+
+    st.info("""
+**How this works:** The optimizer splits your date range into a **Training window (70%)** and a **Test window (30%)**.
+It grid-searches hundreds of buy/sell/interval combinations on the training data, then validates the top 5 on
+the unseen test window. This guards against curve-fitting — if a strategy only worked in the past because it was
+tuned to that specific period, the test window will expose it.
+
+⚠️ Even validated strategies are not guaranteed to work in the future. Use this as a research tool, not a trading signal.
+""")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        opt_ticker  = st.text_input("Ticker", value="TSLA", key="opt_ticker")
+        opt_dollars = st.number_input("Starting Amount ($)", value=10000, step=1000, key="opt_dollars")
+    with col2:
+        opt_start = st.date_input("Start Date", value=datetime(2023, 1, 1),
+                                  min_value=datetime(2018, 1, 1),
+                                  max_value=datetime.now() - timedelta(days=90),
+                                  key="opt_start")
+        opt_end   = st.date_input("End Date", value=datetime.now().date(),
+                                  min_value=datetime(2018, 4, 1),
+                                  max_value=datetime.now().date(),
+                                  key="opt_end")
+    with col3:
+        st.markdown("**What gets tested:**")
+        st.caption("• Buy thresholds: 52 → 79 (step 3)")
+        st.caption("• Sell thresholds: 25 → 49 (step 3)")
+        st.caption("• Intervals: Daily, Weekly, Monthly")
+        st.caption("• ~270 combinations total")
+
+    run_opt = st.button("⚙  Run Optimizer", type="primary", key="run_opt")
+
+    if run_opt:
+        if opt_end <= opt_start:
+            st.error("End date must be after start date.")
+        elif (opt_end - opt_start).days < 90:
+            st.error("Need at least 90 days of history to optimize.")
+        else:
+            total_days = (opt_end - opt_start).days
+            split_day  = int(total_days * 0.70)
+            train_end  = opt_start + timedelta(days=split_day)
+
+            st.markdown(f"""
+            **Running optimizer for `{opt_ticker.upper()}`**
+            - 🏋️ Training window: `{opt_start}` → `{train_end.strftime('%Y-%m-%d')}` ({split_day} days)
+            - 🧪 Test window: `{(train_end + timedelta(days=1)).strftime('%Y-%m-%d')}` → `{opt_end}` ({total_days - split_day} days)
+            """)
+
+            with st.spinner("Testing ~270 parameter combinations… this takes 2–4 minutes ⏳"):
+                result = optimize_strategy(
+                    opt_ticker.upper(), str(opt_start), str(opt_end), float(opt_dollars)
+                )
+
+            if result.get("error"):
+                st.error(f"Error: {result['error']}")
+            else:
+                best = result["best_params"]
+                st.divider()
+
+                # ── Best strategy callout ──────────────────────────────
+                overfit_warn = best.get("overfit_flag", False)
+                box_color    = "#fff8e6" if overfit_warn else "#f0fdf4"
+                border_color = "#f5c518" if overfit_warn else "#0cad6b"
+                warn_text    = "⚠️ Possible overfit — in-sample performance significantly better than out-of-sample." if overfit_warn else "✅ Validated — out-of-sample performance is consistent with training."
+
+                st.markdown(f"""
+                <div style="background:{box_color};border:2px solid {border_color};border-radius:12px;padding:20px 24px;margin-bottom:20px">
+                    <div style="font-family:'Playfair Display';font-size:22px;font-weight:800;margin-bottom:12px">
+                        🏆 Best Validated Strategy
+                    </div>
+                    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;font-family:'IBM Plex Mono';font-size:13px">
+                        <div><div style="color:#7a90a8;font-size:10px;letter-spacing:1px">INTERVAL</div><div style="font-size:20px;font-weight:700">{best['interval']}</div></div>
+                        <div><div style="color:#7a90a8;font-size:10px;letter-spacing:1px">BUY WHEN SCORE ≥</div><div style="font-size:20px;font-weight:700;color:#0cad6b">{best['buy_rating']}</div></div>
+                        <div><div style="color:#7a90a8;font-size:10px;letter-spacing:1px">SELL WHEN SCORE ≤</div><div style="font-size:20px;font-weight:700;color:#e8344a">{best['sell_rating']}</div></div>
+                    </div>
+                    <div style="margin-top:16px;display:grid;grid-template-columns:repeat(4,1fr);gap:12px;font-family:'IBM Plex Mono';font-size:12px">
+                        <div><div style="color:#7a90a8;font-size:10px">TRAIN RETURN</div><div style="color:#0cad6b;font-weight:600">+{best['total_return']}%</div></div>
+                        <div><div style="color:#7a90a8;font-size:10px">TRAIN ALPHA</div><div style="color:#0cad6b;font-weight:600">+{best['alpha']}%</div></div>
+                        <div><div style="color:#7a90a8;font-size:10px">TEST RETURN</div><div style="color:{'#0cad6b' if (best['oos_return'] or 0)>0 else '#e8344a'};font-weight:600">{'+' if (best['oos_return'] or 0)>0 else ''}{best['oos_return']}%</div></div>
+                        <div><div style="color:#7a90a8;font-size:10px">TEST ALPHA</div><div style="color:{'#0cad6b' if (best['oos_alpha'] or 0)>0 else '#e8344a'};font-weight:600">{'+' if (best['oos_alpha'] or 0)>0 else ''}{best['oos_alpha']}%</div></div>
+                    </div>
+                    <div style="margin-top:12px;font-size:11px;color:#7a90a8">{warn_text}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # ── Top 5 comparison table ─────────────────────────────
+                st.markdown("#### Top 5 Strategies — Training vs. Test Performance")
+                st.caption(f"Tested {result['total_combos']} combinations · Sorted by out-of-sample alpha")
+
+                rows = []
+                for i, r in enumerate(result["top5"]):
+                    rows.append({
+                        "Rank":          i + 1,
+                        "Interval":      r["interval"],
+                        "Buy ≥":         r["buy_rating"],
+                        "Sell ≤":        r["sell_rating"],
+                        "Train Return %":r["total_return"],
+                        "Train Alpha %": r["alpha"],
+                        "Train Trades":  r["trades"],
+                        "Test Return %": r["oos_return"],
+                        "Test Alpha %":  r["oos_alpha"],
+                        "Overfit?":      "⚠️ Yes" if r["overfit_flag"] else "✅ No",
+                    })
+                df_opt = pd.DataFrame(rows)
+                st.dataframe(df_opt, hide_index=True, use_container_width=True,
+                             column_config={
+                                 "Train Return %": st.column_config.NumberColumn(format="%.1f%%"),
+                                 "Train Alpha %":  st.column_config.NumberColumn(format="%.1f%%"),
+                                 "Test Return %":  st.column_config.NumberColumn(format="%.1f%%"),
+                                 "Test Alpha %":   st.column_config.NumberColumn(format="%.1f%%"),
+                             })
+
+                # ── Interpretation guide ───────────────────────────────
+                st.divider()
+                with st.expander("📖 How to read these results"):
+                    st.markdown(f"""
+**Training window** (`{opt_start}` → `{train_end.strftime('%Y-%m-%d')}`): The period used to find the best parameters.
+Always looks good — it was optimized on this data.
+
+**Test window** (`{(train_end + timedelta(days=1)).strftime('%Y-%m-%d')}` → `{opt_end}`): Unseen data.
+This is what matters. If the test alpha is positive and close to the train alpha, the strategy has
+*some* generalizability. If test performance collapses vs training, it's overfit.
+
+**Alpha** = Strategy return minus buy-and-hold return. Positive alpha means the strategy beat doing nothing.
+
+**The honest truth:** Even a positive test alpha doesn't guarantee future performance. Markets change.
+Use these settings as a starting point in the Scenario Simulator to explore further.
+""")
+
+                # ── Export ────────────────────────────────────────────
+                st.download_button("⬇ Export Results to Excel", to_excel_bytes(df_opt),
+                                   f"optimizer_{opt_ticker}_{opt_start}_{opt_end}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 5 — METHODOLOGY
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif page == "Methodology":  # Page 5
     st.markdown('<div class="section-title">Scoring Methodology</div>', unsafe_allow_html=True)
     st.markdown('<div class="section-sub">20 DATA POINTS · HORIZON-CALIBRATED WEIGHTS · BRIER VALIDATION</div>', unsafe_allow_html=True)
 
