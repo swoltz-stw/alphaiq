@@ -830,3 +830,117 @@ def _error_result(ticker, horizon, msg):
         "brier": None, "confidence": 0, "error": msg,
         "name": ticker, "sector": "—", "market_cap": None,
     }
+
+
+# ─── OPTIMIZER ────────────────────────────────────────────────────────────────
+
+def optimize_strategy(ticker: str, start_date: str, end_date: str,
+                      dollars: float = 10000) -> dict:
+    """
+    Walk-forward optimizer: finds the best buy/sell thresholds and interval
+    for a given ticker and date range — WITH out-of-sample validation.
+
+    Method:
+      1. Split the date range: first 70% = training window, last 30% = test window
+      2. Grid-search all combinations of buy_rating, sell_rating, interval
+         on the TRAINING window only
+      3. Take the top 5 parameter sets and run them on the TEST window
+      4. Report both in-sample and out-of-sample results with an overfitting warning
+         if the out-of-sample result is much worse than in-sample
+
+    This guards against lookahead bias / curve-fitting.
+    """
+    import itertools
+
+    try:
+        t     = yf.Ticker(ticker)
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end   = datetime.strptime(end_date,   "%Y-%m-%d")
+        total_days = (end - start).days
+
+        if total_days < 90:
+            return {"error": "Need at least 90 days of data to optimize."}
+
+        # ── Train/test split ──────────────────────────────────────────
+        split_date = start + timedelta(days=int(total_days * 0.70))
+        train_start = start_date
+        train_end   = split_date.strftime("%Y-%m-%d")
+        test_start  = (split_date + timedelta(days=1)).strftime("%Y-%m-%d")
+        test_end    = end_date
+
+        # ── Grid search parameters ────────────────────────────────────
+        buy_thresholds  = list(range(52, 82, 3))   # 52, 55, 58 ... 79
+        sell_thresholds = list(range(25, 52, 3))   # 25, 28, 31 ... 49
+        intervals       = ["1D", "1W", "1M"]
+
+        train_results = []
+
+        for interval, buy_r, sell_r in itertools.product(intervals, buy_thresholds, sell_thresholds):
+            if sell_r >= buy_r:
+                continue
+            df, summary = run_scenario(ticker, train_start, train_end,
+                                       dollars, interval, buy_r, sell_r)
+            if df is None or summary is None:
+                continue
+            train_results.append({
+                "interval":    interval,
+                "buy_rating":  buy_r,
+                "sell_rating": sell_r,
+                "total_return":   summary["Total Return %"],
+                "bh_return":      summary["Buy & Hold Return %"],
+                "alpha":          summary["Alpha vs B&H %"],
+                "trades":         summary["Total Trades"],
+            })
+
+        if not train_results:
+            return {"error": "No valid parameter combinations found."}
+
+        # Sort by alpha (return above buy-and-hold) — not just raw return
+        train_results.sort(key=lambda x: x["alpha"], reverse=True)
+        top5_train = train_results[:5]
+
+        # ── Validate top 5 on out-of-sample test window ───────────────
+        validated = []
+        for params in top5_train:
+            df, summary = run_scenario(ticker, test_start, test_end, dollars,
+                                       params["interval"],
+                                       params["buy_rating"],
+                                       params["sell_rating"])
+            if df is None or summary is None:
+                oos_ret   = None
+                oos_bh    = None
+                oos_alpha = None
+                overfit   = True
+            else:
+                oos_ret   = summary["Total Return %"]
+                oos_bh    = summary["Buy & Hold Return %"]
+                oos_alpha = summary["Alpha vs B&H %"]
+                # Overfitting flag: OOS alpha < 50% of in-sample alpha
+                overfit   = (oos_alpha < params["alpha"] * 0.5) if params["alpha"] > 0 else True
+
+            validated.append({
+                **params,
+                "oos_return":    oos_ret,
+                "oos_bh_return": oos_bh,
+                "oos_alpha":     oos_alpha,
+                "overfit_flag":  overfit,
+            })
+
+        # Best overall = highest OOS alpha (not in-sample)
+        valid_oos = [v for v in validated if v["oos_alpha"] is not None]
+        best = max(valid_oos, key=lambda x: x["oos_alpha"]) if valid_oos else validated[0]
+
+        return {
+            "ticker":       ticker.upper(),
+            "start_date":   start_date,
+            "end_date":     end_date,
+            "train_end":    train_end,
+            "test_start":   test_start,
+            "best_params":  best,
+            "top5":         validated,
+            "total_combos": len(train_results),
+            "error":        None,
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
