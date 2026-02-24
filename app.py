@@ -22,7 +22,9 @@ st.set_page_config(
 from scorer import (
     fetch_and_score, fetch_and_score_batch, backtest_ticker,
     run_scenario, optimize_strategy, fetch_diagnostics,
-    WEIGHTS, DATA_POINT_LABELS, _signal_label,
+    score_market_probability, run_market_scenario,
+    WEIGHTS, DATA_POINT_LABELS, CATEGORIES, CATEGORY_WEIGHTS, POINT_WEIGHTS,
+    MARKET_PREDICTORS, INDEX_TICKERS, _signal_label,
 )
 
 # ── Index ticker lists ────────────────────────────────────────────────────────
@@ -160,7 +162,8 @@ with st.sidebar:
     st.divider()
     page = st.radio(
         "Navigate",
-        ["◎  Evaluator", "⊞  Screener", "↺  Backtest", "⚙  Optimizer", "⬡  Methodology", "🔬  Diagnostics"],
+        ["◎  Evaluator", "⊞  Screener", "↺  Backtest", "⚙  Optimizer",
+         "🌐  Market Probability", "⬡  Methodology", "🔬  Diagnostics"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -244,28 +247,88 @@ if page == "Evaluator":
                     </div>
                     """, unsafe_allow_html=True)
 
-            # Data points breakdown
-            if show_dp:
-                st.divider()
-                st.markdown("**Data Point Breakdown** · 1 Month")
-                r1m = results["1M"]
-                dp_data = {
-                    DATA_POINT_LABELS[k]: v
-                    for k, v in r1m["data_scores"].items()
-                }
-                dp_df = pd.DataFrame(dp_data.items(), columns=["Data Point", "Score"])
-                dp_df = dp_df.sort_values("Score", ascending=False)
+            # Category + Data point breakdown
+            st.divider()
+            r1m    = results["1M"]
+            is_etf = r1m.get("is_etf", False)
 
-                cols = st.columns(4)
-                for idx, row in dp_df.iterrows():
-                    c = cols[idx % 4]
-                    clr = score_color(row["Score"])
-                    c.markdown(f"""
-                    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 14px;margin-bottom:8px">
-                        <div style="font-size:10px;color:#7a90a8;font-family:'IBM Plex Mono';margin-bottom:4px">{row['Data Point']}</div>
-                        <div style="font-family:'Playfair Display';font-size:22px;color:{clr}">{row['Score']}</div>
+            if is_etf:
+                st.info("📦 **ETF detected** — Fundamental Quality and Valuation categories are not applicable. Score is based on Technical, Sentiment, and Macro categories only.")
+
+            # ── Category score cards ──────────────────────────────────────
+            st.markdown("#### Category Scores · 1 Month")
+            cat_results = r1m.get("category_scores", {})
+
+            from scorer import CATEGORIES, CATEGORY_WEIGHTS
+            cat_cols = st.columns(len(CATEGORIES))
+
+            for i, (cat_name, cat_info) in enumerate(CATEGORIES.items()):
+                res = cat_results.get(cat_name, {})
+                cat_score  = res.get("score")
+                n_avail    = res.get("n_available", 0)
+                n_total    = res.get("n_total", len(cat_info["points"]))
+                cat_weight = CATEGORY_WEIGHTS["1M"].get(cat_name, 5)
+
+                if cat_score is None:
+                    display_score = "N/A"
+                    clr           = "#b0b8c4"
+                    bar_val       = 0
+                else:
+                    display_score = cat_score
+                    clr           = score_color(cat_score)
+                    bar_val       = cat_score
+
+                with cat_cols[i]:
+                    st.markdown(f"""
+                    <div class="card" style="text-align:center;border-top:3px solid {clr};min-height:160px">
+                        <div style="font-size:11px;color:#7a90a8;font-family:'IBM Plex Mono';letter-spacing:1px;margin-bottom:6px">
+                            {cat_info['emoji']} {cat_name.upper()}
+                        </div>
+                        <div style="font-family:'Playfair Display';font-size:38px;color:{clr};line-height:1">
+                            {display_score}
+                        </div>
+                        <div style="font-size:10px;color:#7a90a8;margin-top:6px">
+                            {n_avail}/{n_total} points · wt {cat_weight}
+                        </div>
+                        <div style="font-size:10px;color:#7a90a8;margin-top:4px;font-style:italic">
+                            {cat_info['description'][:40]}…
+                        </div>
                     </div>
                     """, unsafe_allow_html=True)
+
+            if show_dp:
+                st.divider()
+                st.markdown("#### Individual Data Points · 1 Month")
+
+                # Group by category
+                for cat_name, cat_info in CATEGORIES.items():
+                    res = cat_results.get(cat_name, {})
+                    cat_score = res.get("score")
+                    clr = score_color(cat_score) if cat_score else "#b0b8c4"
+
+                    st.markdown(f"**{cat_info['emoji']} {cat_name}** "
+                                f"<span style='color:{clr};font-family:IBM Plex Mono;font-size:13px'>"
+                                f"{'Category score: ' + str(cat_score) if cat_score else 'N/A for this security type'}</span>",
+                                unsafe_allow_html=True)
+
+                    pt_cols = st.columns(len(cat_info["points"]))
+                    for j, pt_key in enumerate(cat_info["points"]):
+                        raw_val = r1m["data_scores"].get(pt_key, 50)
+                        is_none = r1m.get("category_scores", {}).get(cat_name, {}).get("n_available", 1) == 0
+                        label   = DATA_POINT_LABELS.get(pt_key, pt_key)
+                        pt_clr  = score_color(raw_val) if not is_etf or cat_info.get("available_for_etf") else "#b0b8c4"
+                        display = "N/A" if (is_etf and not cat_info.get("available_for_etf", True)) else raw_val
+
+                        with pt_cols[j]:
+                            st.markdown(f"""
+                            <div style="background:#f8fafc;border:1px solid #e2e8f0;border-left:3px solid {pt_clr};
+                                        border-radius:6px;padding:10px 12px;margin-bottom:8px;min-height:72px">
+                                <div style="font-size:9px;color:#7a90a8;font-family:'IBM Plex Mono';
+                                            margin-bottom:4px;line-height:1.3">{label}</div>
+                                <div style="font-family:'Playfair Display';font-size:24px;color:{pt_clr}">{display}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                    st.write("")
 
             # Export
             export_rows = []
@@ -722,10 +785,188 @@ Use these settings as a starting point in the Scenario Simulator to explore furt
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 5 — METHODOLOGY
+# PAGE 5 — MARKET PROBABILITY
 # ══════════════════════════════════════════════════════════════════════════════
 
-elif page == "Methodology":  # Page 5
+elif page == "Market Probability":
+    st.markdown('<div class="section-title">Market Probability</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-sub">INDEX FORECASTING · 7 MACRO PREDICTORS · SCENARIO TESTING</div>', unsafe_allow_html=True)
+
+    st.info("""
+**Market Probability** uses 7 academically-validated macro predictors — not individual stock factors —
+to forecast the direction of the DOW, NASDAQ, or S&P 500. Weights are derived directly from empirical
+correlations with 12-month forward index returns (Shiller, Harvey, AQR research).
+""")
+
+    mp_tab, ms_tab = st.tabs(["📊 Market Score", "💰 Market Scenario"])
+
+    # ── Tab 1: Market Score ───────────────────────────────────────────────────
+    with mp_tab:
+        col1, col2 = st.columns(2)
+        with col1:
+            mp_index = st.selectbox("Index", list(INDEX_TICKERS.keys()), key="mp_index")
+        with col2:
+            st.markdown("**7 Predictors Used:**")
+            for k, (w, desc, _) in MARKET_PREDICTORS.items():
+                st.caption(f"• {desc} (weight: {w})")
+
+        run_mp = st.button("▶  Score Market", type="primary", key="run_mp")
+
+        if run_mp:
+            with st.spinner(f"Running 7 macro predictors for {mp_index}… (30-60 seconds)"):
+                mp_result = score_market_probability(mp_index)
+
+            if mp_result.get("error"):
+                st.error(mp_result["error"])
+            else:
+                st.divider()
+                overall = mp_result["overall"]
+                clr     = score_color(overall)
+                etf_px  = mp_result.get("etf_price")
+
+                # Main score callout
+                st.markdown(f"""
+                <div class="card" style="text-align:center;border-top:4px solid {clr};max-width:500px;margin:0 auto 24px">
+                    <div style="font-family:'IBM Plex Mono';font-size:11px;color:#7a90a8;letter-spacing:2px">
+                        {mp_result['index_name'].upper()} · {mp_result['etf']}
+                    </div>
+                    <div style="font-family:'Playfair Display';font-size:72px;color:{clr};line-height:1;margin:8px 0">
+                        {overall}
+                    </div>
+                    <div style="font-size:12px;color:#7a90a8">/ 100</div>
+                    {signal_html(mp_result['signal'])}
+                    <div style="margin-top:12px;font-family:'IBM Plex Mono';font-size:13px;color:#1a2332">
+                        Current: ${etf_px:,.2f}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Price targets by horizon
+                if mp_result.get("targets"):
+                    st.markdown("#### Price Targets by Horizon")
+                    t_cols = st.columns(5)
+                    for i, (h, tgt) in enumerate(mp_result["targets"].items()):
+                        if etf_px:
+                            chg = round((tgt/etf_px-1)*100, 1)
+                            chg_clr = "#0cad6b" if chg > 0 else "#e8344a"
+                            chg_str = f"+{chg}%" if chg > 0 else f"{chg}%"
+                        else:
+                            chg_str = "—"; chg_clr = "#7a90a8"
+                        with t_cols[i]:
+                            st.markdown(f"""
+                            <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;
+                                        padding:12px;text-align:center">
+                                <div style="font-size:10px;color:#7a90a8;font-family:'IBM Plex Mono'">{HORIZON_LABELS[h]}</div>
+                                <div style="font-family:'IBM Plex Mono';font-size:16px;font-weight:700;margin:4px 0">${tgt:,.2f}</div>
+                                <div style="font-size:12px;color:{chg_clr};font-weight:600">{chg_str}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                # Predictor breakdown
+                st.divider()
+                st.markdown("#### Predictor Breakdown")
+                pred_rows = []
+                for key, details in mp_result["predictors"].items():
+                    pred_rows.append({
+                        "Predictor":   details["description"],
+                        "Score":       details["score"],
+                        "Signal":      details["signal"],
+                        "Weight (r×100)": details["weight"],
+                        "Detail":      details["detail"],
+                        "Direction Note": details["direction"],
+                    })
+                df_pred = pd.DataFrame(pred_rows).sort_values("Weight (r×100)", ascending=False)
+                st.dataframe(df_pred, hide_index=True, use_container_width=True,
+                             column_config={
+                                 "Score": st.column_config.ProgressColumn(
+                                     "Score", min_value=0, max_value=100, format="%d"),
+                                 "Weight (r×100)": st.column_config.NumberColumn(
+                                     "Weight", format="%d",
+                                     help="Empirical correlation with 12M forward returns × 100"),
+                             })
+
+                # Bull/bear breakdown
+                bull = [r for r in pred_rows if r["Score"] >= 60]
+                bear = [r for r in pred_rows if r["Score"] <= 40]
+                neut = [r for r in pred_rows if 40 < r["Score"] < 60]
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.markdown(f"**🟢 Bullish signals ({len(bull)})**")
+                    for r in bull: st.caption(f"• {r['Predictor']}: {r['Score']}")
+                with c2:
+                    st.markdown(f"**🟡 Neutral signals ({len(neut)})**")
+                    for r in neut: st.caption(f"• {r['Predictor']}: {r['Score']}")
+                with c3:
+                    st.markdown(f"**🔴 Bearish signals ({len(bear)})**")
+                    for r in bear: st.caption(f"• {r['Predictor']}: {r['Score']}")
+
+                st.download_button("⬇ Export to Excel", to_excel_bytes(df_pred),
+                                   f"market_probability_{mp_index.replace(' ','_')}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # ── Tab 2: Market Scenario ────────────────────────────────────────────────
+    with ms_tab:
+        st.markdown("Test how a buy/sell strategy based on market momentum + VIX would have performed on a major index.")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            ms_index   = st.selectbox("Index", list(INDEX_TICKERS.keys()), key="ms_index")
+            ms_dollars = st.number_input("Starting Amount ($)", value=10000, step=1000, key="ms_dollars")
+        with col2:
+            ms_start   = st.date_input("Start Date", value=datetime(2022,1,1),
+                                        min_value=datetime(2015,1,1),
+                                        max_value=datetime.now()-timedelta(days=30), key="ms_start")
+            ms_end     = st.date_input("End Date", value=datetime.now().date(),
+                                        min_value=datetime(2015,4,1),
+                                        max_value=datetime.now().date(), key="ms_end")
+        with col3:
+            ms_interval   = st.selectbox("Check Interval", ["1W","1M","1D"], key="ms_interval")
+            ms_buy_rating = st.slider("Buy when score ≥", 50, 80, 58, key="ms_buy")
+            ms_sell_rating= st.slider("Sell when score ≤", 20, 50, 42, key="ms_sell")
+
+        run_ms = st.button("▶  Run Market Scenario", type="primary", key="run_ms")
+
+        if run_ms:
+            if ms_end <= ms_start:
+                st.error("End date must be after start date.")
+            elif ms_sell_rating >= ms_buy_rating:
+                st.error("Sell threshold must be below buy threshold.")
+            else:
+                with st.spinner(f"Simulating {ms_index} from {ms_start} to {ms_end}…"):
+                    df_ms, summary_ms = run_market_scenario(
+                        ms_index, str(ms_start), str(ms_end),
+                        float(ms_dollars), ms_interval, ms_buy_rating, ms_sell_rating
+                    )
+
+                if df_ms is None:
+                    st.error(f"Error: {summary_ms}")
+                else:
+                    etf_label = INDEX_TICKERS[ms_index]["etf"]
+                    c1,c2,c3,c4 = st.columns(4)
+                    alpha = summary_ms["Alpha vs B&H %"]
+                    c1.metric("Total Return",    f"{summary_ms['Total Return %']}%")
+                    c2.metric(f"Buy & Hold ({etf_label})", f"{summary_ms['Buy & Hold Return %']}%")
+                    c3.metric("Alpha vs B&H",    f"{alpha:+.1f}%",
+                              delta_color="normal" if alpha >= 0 else "inverse")
+                    c4.metric("Total Trades",    summary_ms["Total Trades"])
+
+                    st.dataframe(df_ms, column_config={
+                        "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
+                        "Portfolio Value": st.column_config.NumberColumn("Portfolio Value", format="$%.2f"),
+                        "Cash": st.column_config.NumberColumn("Cash", format="$%.2f"),
+                        "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                    }, hide_index=True, use_container_width=True)
+
+                    st.download_button("⬇ Export to Excel", to_excel_bytes(df_ms),
+                                       f"market_scenario_{ms_index}_{ms_start}_to_{ms_end}.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 6 — METHODOLOGY
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif page == "Methodology":  # Page 6
     st.markdown('<div class="section-title">Scoring Methodology</div>', unsafe_allow_html=True)
     st.markdown('<div class="section-sub">20 DATA POINTS · HORIZON-CALIBRATED WEIGHTS · BRIER VALIDATION</div>', unsafe_allow_html=True)
 
@@ -772,19 +1013,67 @@ fundamentals like revenue growth, FCF yield, and EPS growth.
         st.dataframe(w_df, use_container_width=True)
         st.caption("Weights are on a 1–10 scale per horizon. The composite score is a weighted average.")
 
-    with st.expander("📊 20 Data Points — Ranked by Long-Term Importance"):
-        dp_rows = []
-        for k, label in DATA_POINT_LABELS.items():
-            avg_w = round(sum(WEIGHTS[h][k] for h in HORIZONS) / len(HORIZONS), 1)
-            dp_rows.append({"Data Point": label, "Key": k, "Avg Weight": avg_w,
-                            "1D": WEIGHTS["1D"][k], "1W": WEIGHTS["1W"][k],
-                            "1M": WEIGHTS["1M"][k], "1Q": WEIGHTS["1Q"][k],
-                            "1Y": WEIGHTS["1Y"][k]})
-        dp_df = pd.DataFrame(dp_rows).sort_values("1Y", ascending=False).drop(columns=["Key"])
-        st.dataframe(dp_df, hide_index=True, use_container_width=True,
+    with st.expander("📊 Factor Correlation Rankings — What Actually Predicts Returns"):
+        st.markdown("""
+Based on Fama-French, AQR, and empirical studies on S&P 500 returns 1990–2020.
+**r** = Pearson correlation with forward returns. Higher = stronger predictor.
+""")
+        short_factors = [
+            ("Price Momentum (1M)", "Technical Momentum", "Short", 0.08, "Strongest short-term signal. Stocks going up tend to keep going up for 1-4 weeks."),
+            ("RSI (contrarian)", "Technical Momentum", "Short", 0.06, "Oversold stocks bounce. Overbought stocks mean-revert. Works best at extremes (<25, >75)."),
+            ("Volume × Direction", "Technical Momentum", "Short", 0.05, "High volume on price up-moves = institutional conviction. Low volume = weak signal."),
+            ("MACD", "Technical Momentum", "Short", 0.05, "Histogram crossovers have edge. Trend direction more predictive than level."),
+            ("Earnings Proximity", "Macro & Sector", "Short", 0.04, "Post-earnings drift: stocks move 3-5% in direction of surprise for 2-4 weeks."),
+            ("Short Interest", "Sentiment & Flow", "Short", 0.04, "High short interest = squeeze fuel. Low short = less upside catalyst."),
+            ("Sector Momentum", "Macro & Sector", "Short", 0.04, "Sector rotation: money flows into hot sectors, flows out of cold ones."),
+            ("52-Week Position", "Technical Momentum", "Short", 0.03, "Near 52w low + bouncing = strong mean-reversion signal."),
+        ]
+        long_factors = [
+            ("Revenue Growth", "Fundamental Quality", "Long", 0.18, "Strongest long-term signal. Growing revenue predicts returns better than any other single factor."),
+            ("EPS Growth", "Fundamental Quality", "Long", 0.16, "Earnings growth drives price over 3-12 month horizons."),
+            ("FCF Yield", "Fundamental Quality", "Long", 0.15, "Free cash flow yield outperforms P/E as a value signal. Companies with high FCF outperform."),
+            ("Analyst Target Upside", "Valuation", "Long", 0.14, "Analyst price targets have real predictive power, especially when consensus is strong."),
+            ("Profit Margin", "Fundamental Quality", "Long", 0.13, "High-margin businesses have structural advantages that compound over time."),
+            ("EPS Surprise", "Valuation", "Long", 0.12, "Earnings surprises cause multi-week drift. Market underreacts to earnings news."),
+            ("Analyst Revisions", "Sentiment & Flow", "Long", 0.11, "Upward revisions predict outperformance. Analysts herd — first mover advantage."),
+            ("PEG Ratio", "Valuation", "Long", 0.10, "Growth-adjusted P/E is more predictive than raw P/E for long-term returns."),
+            ("P/E vs Sector", "Valuation", "Long", 0.09, "Relative cheapness within sector matters more than absolute P/E level."),
+            ("Debt/Equity", "Fundamental Quality", "Long", 0.07, "Low leverage protects in downturns and allows more capital return."),
+            ("Macro / VIX", "Macro & Sector", "Long", 0.06, "High VIX regimes produce lower average returns. Macro matters for timing."),
+        ]
+        all_f = short_factors + long_factors
+        df_f = pd.DataFrame(all_f, columns=["Factor","Category","Best For","r","Why It Works"])
+        df_f = df_f.sort_values("r", ascending=False)
+        st.dataframe(df_f, hide_index=True, use_container_width=True,
                      column_config={
-                         "Avg Weight": st.column_config.ProgressColumn("Avg Weight", min_value=0, max_value=10, format="%.1f"),
+                         "r": st.column_config.ProgressColumn("Corr (r)", min_value=0, max_value=0.20, format="%.2f"),
+                         "Best For": st.column_config.TextColumn("Best For", width="small"),
                      })
+        st.caption("Note: These are average correlations. Individual correlations vary by market regime, sector, and time period. No single factor is reliable in all conditions.")
+
+    with st.expander("🗂 Category Architecture — How Buckets Prevent Signal Cancellation"):
+        from scorer import CATEGORIES, CATEGORY_WEIGHTS, POINT_WEIGHTS
+        st.markdown("""
+**Why categories matter:** Without bucketing, a bullish RSI (74) and bearish MACD (28) average to 51 — neutral.
+With category buckets, both contribute to the **Technical Momentum** category score independently,
+and their *combined direction within the category* determines whether Technical is bullish or bearish.
+Counteracting signals across *different* categories (e.g. cheap valuation + bad technicals) produce a
+genuinely mixed score rather than a false neutral.
+""")
+        for cat_name, cat_info in CATEGORIES.items():
+            pts_info = []
+            for p in cat_info["points"]:
+                pts_info.append({
+                    "Data Point": DATA_POINT_LABELS.get(p, p),
+                    "Within-Cat Weight": POINT_WEIGHTS.get(p, 1.0),
+                    "1D Cat Weight": CATEGORY_WEIGHTS["1D"].get(cat_name, 5),
+                    "1M Cat Weight": CATEGORY_WEIGHTS["1M"].get(cat_name, 5),
+                    "1Y Cat Weight": CATEGORY_WEIGHTS["1Y"].get(cat_name, 5),
+                    "ETF Applicable": "✅" if cat_info.get("available_for_etf") else "❌",
+                })
+            st.markdown(f"**{cat_info['emoji']} {cat_name}** — {cat_info['description']}")
+            st.dataframe(pd.DataFrame(pts_info), hide_index=True, use_container_width=True)
+            st.write("")
 
     with st.expander("⚠️ Limitations & Roadmap"):
         st.markdown("""
