@@ -349,57 +349,101 @@ elif page == "Screener":
     st.markdown('<div class="section-title">Stock Screener</div>', unsafe_allow_html=True)
     st.markdown('<div class="section-sub">FILTER ANY INDEX BY SCORE RANGE AND HORIZON</div>', unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         idx = st.selectbox("Index", list(INDICES.keys()))
+        h   = st.select_slider("Horizon", options=HORIZONS,
+                                format_func=lambda x: HORIZON_LABELS[x], value="1M")
     with col2:
-        h = st.select_slider("Horizon", options=HORIZONS,
-                              format_func=lambda x: HORIZON_LABELS[x], value="1M")
-    with col3:
-        st.write("")
+        min_score, max_score = st.slider("Score filter range", 0, 100, (0, 100), step=5)
+        show_dist = st.toggle("Show score distribution chart", value=True)
 
-    min_score, max_score = st.slider("Score range", 0, 100, (60, 100), step=5)
-    run_scr = st.button("▶  Run Screener", type="primary")
+    run_scr = st.button("▶  Scan Index", type="primary")
 
     if run_scr:
         tickers = INDICES[idx]
-        prog = st.progress(0, text="Scanning stocks...")
-        results = []
-        for i, t in enumerate(tickers):
-            r = fetch_and_score(t, h)
-            if min_score <= r["overall"] <= max_score:
-                results.append(r)
-            prog.progress((i + 1) / len(tickers), text=f"Scanning {t}…")
+        prog    = st.progress(0, text="Scanning stocks...")
+        all_results = []
+
+        for i, ticker in enumerate(tickers):
+            r = fetch_and_score(ticker, h)
+            all_results.append(r)
+            prog.progress((i + 1) / len(tickers), text=f"Scoring {ticker}… ({i+1}/{len(tickers)})")
         prog.empty()
 
-        if not results:
-            st.info(f"No stocks matched score range {min_score}–{max_score}.")
-        else:
-            df = pd.DataFrame([{
-                "Ticker": r["ticker"],
-                "Name": r.get("name", ""),
-                "Sector": r.get("sector", ""),
-                "Score": r["overall"],
-                "Signal": r["signal"],
-                "Price": r.get("price"),
-                "Target": r.get("target"),
-                "Upside %": round((r["target"]/r["price"]-1)*100, 1) if r.get("price") and r.get("target") else None,
-                "Confidence %": r["confidence"],
-            } for r in sorted(results, key=lambda x: -x["overall"])])
+        # Build full dataframe first
+        all_df = pd.DataFrame([{
+            "Ticker":       r["ticker"],
+            "Name":         r.get("name", ""),
+            "Sector":       r.get("sector", ""),
+            "Score":        r["overall"],
+            "Raw Score":    r.get("raw_score", r["overall"]),
+            "Signal":       r["signal"],
+            "Price":        r.get("price"),
+            "Target":       r.get("target"),
+            "Upside %":     round((r["target"]/r["price"]-1)*100, 1)
+                            if r.get("price") and r.get("target") else None,
+            "Confidence %": r["confidence"],
+        } for r in sorted(all_results, key=lambda x: -x["overall"])])
 
-            st.success(f"**{len(df)} stocks** matched · {idx} · {HORIZON_LABELS[h]}")
+        # Score distribution chart
+        if show_dist and not all_df.empty:
+            st.markdown("#### Score Distribution — All Scanned Stocks")
+            bins   = list(range(0, 105, 5))
+            labels = [f"{b}-{b+4}" for b in bins[:-1]]
+            counts = pd.cut(all_df["Score"], bins=bins, labels=labels, right=False).value_counts().sort_index()
+            dist_df = pd.DataFrame({"Score Range": counts.index, "# Stocks": counts.values})
+
+            # Colour bars by zone
+            bar_colors = []
+            for label in dist_df["Score Range"]:
+                lo = int(label.split("-")[0])
+                if lo >= 65:   bar_colors.append("#0cad6b")
+                elif lo >= 45: bar_colors.append("#d97706")
+                else:          bar_colors.append("#e8344a")
+
+            # Use st.bar_chart (native, no plotly needed)
+            st.bar_chart(dist_df.set_index("Score Range"), use_container_width=True, height=200)
+
+            # Quick stats row
+            sc = all_df["Score"]
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Avg Score",   round(sc.mean(), 1))
+            c2.metric("Median",      round(sc.median(), 1))
+            c3.metric("Lowest",      int(sc.min()))
+            c4.metric("Highest",     int(sc.max()))
+            c5.metric("Std Dev",     round(sc.std(), 1))
+            st.divider()
+
+        # Apply filter
+        filtered_df = all_df[(all_df["Score"] >= min_score) & (all_df["Score"] <= max_score)]
+
+        if filtered_df.empty:
+            # Helpful diagnostic instead of silent failure
+            st.warning(f"No stocks matched score range **{min_score}–{max_score}**.")
+            st.markdown(f"Score range of all {len(all_df)} scanned stocks: "
+                        f"**{int(all_df['Score'].min())}** – **{int(all_df['Score'].max())}** "
+                        f"(avg: {round(all_df['Score'].mean(),1)})")
+            st.markdown("Try widening your score filter, or check the distribution chart above.")
+            st.dataframe(all_df.head(10), hide_index=True, use_container_width=True)
+        else:
+            st.success(f"**{len(filtered_df)} of {len(all_df)} stocks** matched score range "
+                       f"{min_score}–{max_score} · {idx} · {HORIZON_LABELS[h]}")
             st.dataframe(
-                df,
+                filtered_df,
                 column_config={
-                    "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
-                    "Upside %": st.column_config.NumberColumn("Upside %", format="%.1f%%"),
-                    "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
-                    "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
+                    "Score":        st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
+                    "Raw Score":    st.column_config.NumberColumn("Raw Score", format="%.1f",
+                                    help="Pre-stretch composite score. Shows true separation before curve is applied."),
+                    "Upside %":     st.column_config.NumberColumn("Upside %", format="%.1f%%"),
+                    "Price":        st.column_config.NumberColumn("Price",  format="$%.2f"),
+                    "Target":       st.column_config.NumberColumn("Target", format="$%.2f"),
+                    "Confidence %": st.column_config.NumberColumn("Confidence %", format="%d%%"),
                 },
                 hide_index=True,
                 use_container_width=True,
             )
-            st.download_button("⬇ Export to Excel", to_excel_bytes(df),
+            st.download_button("⬇ Export to Excel", to_excel_bytes(filtered_df),
                                f"screener_{idx.replace(' ','_')}_{h}.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
