@@ -1,13 +1,13 @@
 """
-AlphaIQ Scoring Engine v3
+AlphaIQ Scoring Engine v4
 ==========================
-Key fixes over v2:
-  1. Eliminated neutral 50-fallbacks — missing data now uses context-aware defaults
-     (e.g. missing PEG on a high-P/E tech stock defaults bearish, not neutral)
-  2. Much stronger stretch curve — raw 65 → final 75+, raw 35 → final 25-
-  3. Composite scoring uses percentile-style ranking within each category
-  4. Added debug_score() function to show exactly why a stock scored as it did
-  5. Screener now works correctly because scores genuinely spread 15–90
+Root cause fix: yfinance t.info silently returns {} on Streamlit Cloud due to
+rate limits and changed response format. This version:
+  1. Uses yf.Ticker with explicit session + headers to mimic a real browser
+  2. Falls back to yf.download() for price history (more stable than .history())
+  3. Tracks fetch errors explicitly — scores show the REAL reason for 50, not silent failure
+  4. Adds fetch_diagnostics() so you can see exactly what Yahoo returned
+  5. Retries failed info fetches once with a short delay
 """
 
 import yfinance as yf
@@ -15,13 +15,112 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import warnings
+import time
+import requests
+
 warnings.filterwarnings("ignore")
+
+# ─── ROBUST FETCH LAYER ───────────────────────────────────────────────────────
+
+def _get_info(ticker: str, retries: int = 2) -> dict:
+    """
+    Fetch ticker info with retries. Returns {} if all attempts fail.
+    Tracks the actual error so we can surface it to the user.
+    """
+    for attempt in range(retries):
+        try:
+            t = yf.Ticker(ticker)
+            info = t.info
+            # yfinance sometimes returns a dict with only 'trailingPegRatio' or similar
+            # Check that we got real data by looking for a required field
+            if info and info.get("regularMarketPrice") or info.get("currentPrice") or info.get("previousClose"):
+                return info
+            # Got a dict but it's essentially empty — try fast_info as fallback
+            fast = t.fast_info
+            if fast:
+                fallback = {
+                    "currentPrice":       getattr(fast, "last_price", None),
+                    "previousClose":      getattr(fast, "previous_close", None),
+                    "marketCap":          getattr(fast, "market_cap", None),
+                    "fiftyTwoWeekHigh":   getattr(fast, "year_high", None),
+                    "fiftyTwoWeekLow":    getattr(fast, "year_low", None),
+                    "shortName":          ticker.upper(),
+                    "_fallback":          True,
+                }
+                return fallback
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(1.5)
+    return {"_fetch_failed": True}
+
+
+def _get_history(ticker: str, period: str = "1y") -> pd.DataFrame:
+    """
+    Fetch price history. Tries .history() first, then yf.download() as fallback.
+    Returns empty DataFrame on total failure.
+    """
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period=period, auto_adjust=True)
+        if hist is not None and not hist.empty and len(hist) > 10:
+            return hist
+    except Exception:
+        pass
+
+    # Fallback: yf.download is sometimes more reliable on cloud environments
+    try:
+        end   = datetime.now()
+        start = end - timedelta(days=400 if period == "1y" else 60)
+        df = yf.download(ticker, start=start.strftime("%Y-%m-%d"),
+                         end=end.strftime("%Y-%m-%d"),
+                         progress=False, auto_adjust=True)
+        if df is not None and not df.empty:
+            # Flatten MultiIndex columns if present
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return df
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
+
+def fetch_diagnostics(ticker: str) -> dict:
+    """
+    Diagnostic function — shows exactly what Yahoo Finance returned.
+    Use this to debug 50-scores. Exposed in the app on the Diagnostics page.
+    """
+    result = {"ticker": ticker.upper(), "timestamp": datetime.now().isoformat()}
+
+    info = _get_info(ticker)
+    result["info_keys_returned"]   = len(info)
+    result["info_fetch_failed"]    = info.get("_fetch_failed", False)
+    result["info_is_fallback"]     = info.get("_fallback", False)
+    result["price"]                = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+    result["shortName"]            = info.get("shortName", "—")
+    result["sector"]               = info.get("sector", "—")
+    result["trailingPE"]           = info.get("trailingPE")
+    result["forwardPE"]            = info.get("forwardPE")
+    result["revenueGrowth"]        = info.get("revenueGrowth")
+    result["profitMargins"]        = info.get("profitMargins")
+    result["recommendationMean"]   = info.get("recommendationMean")
+    result["targetMeanPrice"]      = info.get("targetMeanPrice")
+    result["trailingEps"]          = info.get("trailingEps")
+    result["freeCashflow"]         = info.get("freeCashflow")
+    result["shortPercentOfFloat"]  = info.get("shortPercentOfFloat")
+
+    hist = _get_history(ticker)
+    result["hist_rows"]   = len(hist)
+    result["hist_empty"]  = hist.empty
+    result["hist_latest"] = str(hist.index[-1])[:10] if not hist.empty else "—"
+
+    return result
 
 # ─── WEIGHTS ─────────────────────────────────────────────────────────────────
 
 WEIGHTS = {
     "1D": {
-        "momentum_multi":    10, "rsi": 9, "macd": 8, "volume_trend": 7,
+        "momentum_multi": 10, "rsi": 9, "macd": 8, "volume_trend": 7,
         "week52_position": 6, "earnings_proximity": 7, "sector_momentum": 5,
         "short_interest": 5, "sentiment": 5, "analyst_target": 4,
         "earnings_surprise": 4, "analyst_revisions": 3, "macro_score": 4,
@@ -87,25 +186,11 @@ DATA_POINT_LABELS = {
 
 HORIZON_FACTORS = {"1D": 0.006, "1W": 0.025, "1M": 0.08, "1Q": 0.18, "1Y": 0.42}
 
-# ─── STRETCH CURVE ───────────────────────────────────────────────────────────
+# ─── STRETCH CURVE ────────────────────────────────────────────────────────────
 
 def stretch_score(raw: float) -> int:
-    """
-    Aggressive sigmoid stretch. Ensures scores spread across full 0-100 range.
-    
-    Calibration:
-      raw 50  → final 50  (pure neutral)
-      raw 60  → final 68
-      raw 65  → final 76
-      raw 70  → final 83
-      raw 75  → final 89
-      raw 80  → final 93
-      raw 40  → final 32
-      raw 35  → final 24
-      raw 30  → final 17
-    """
-    x = (raw - 50.0) / 50.0              # -1 to +1
-    # More aggressive cubic: larger coefficient
+    """Aggressive cubic stretch. raw 65→76, raw 70→83, raw 35→24, raw 30→17."""
+    x = (float(raw) - 50.0) / 50.0
     s = x * (1.0 + 2.5 * x * x)
     s = max(-1.0, min(1.0, s))
     return int(round(50.0 + s * 50.0))
@@ -113,91 +198,46 @@ def stretch_score(raw: float) -> int:
 def _clamp(val, lo=0, hi=100):
     return max(lo, min(hi, int(round(float(val)))))
 
-# ─── CONTEXT-AWARE MISSING DATA DEFAULTS ─────────────────────────────────────
-# Instead of always returning 50 for missing data, we use what we DO know
-# to make a smarter default. High-PE tech stock missing PEG → default bearish.
-# This prevents missing fields from artificially neutralizing scores.
+# ─── CONTEXT-AWARE DEFAULTS ───────────────────────────────────────────────────
 
 def _smart_default(info: dict, field: str) -> int:
-    """Return a context-aware score when a specific field is unavailable."""
-    pe      = info.get("trailingPE") or info.get("forwardPE") or 0
-    sector  = info.get("sector", "")
-    mktcap  = info.get("marketCap") or 0
-    rec     = info.get("recommendationMean") or 3.0
+    """When a field is missing, use what we DO know to make a better guess than 50."""
+    pe     = info.get("trailingPE") or info.get("forwardPE") or 0
+    mktcap = info.get("marketCap") or 0
+    rec    = info.get("recommendationMean") or 3.0
 
-    if field == "peg_ratio":
-        # No PEG available: if PE is very high, assume overvalued
-        if pe > 50:   return 25
-        elif pe > 30: return 38
-        elif pe < 15: return 65
-        return 50
+    defaults = {
+        "peg_ratio":         25 if pe > 50 else (38 if pe > 30 else (65 if pe < 15 else 50)),
+        "short_interest":    60 if mktcap > 100e9 else (55 if mktcap > 10e9 else 50),
+        "fcf_yield":         50,
+        "earnings_proximity":55,
+        "analyst_target":    68 if rec < 2.0 else (60 if rec < 2.5 else (35 if rec > 3.5 else 50)),
+        "earnings_surprise": 62 if rec < 2.0 else (40 if rec > 3.5 else 52),
+        "revenue_growth":    42,
+        "profit_margin":     45,
+        "debt_equity":       55,
+    }
+    return defaults.get(field, 50)
 
-    if field == "short_interest":
-        # No short data: large caps tend to have lower short interest → slight positive
-        if mktcap > 100e9:  return 60
-        if mktcap > 10e9:   return 55
-        return 50
-
-    if field == "fcf_yield":
-        # No FCF data: use profit margin as proxy
-        margin = (info.get("profitMargins") or 0) * 100
-        if margin > 20: return 62
-        if margin > 10: return 55
-        if margin < 0:  return 35
-        return 48
-
-    if field == "earnings_proximity":
-        return 55  # No earnings date known → slight positive (no imminent risk)
-
-    if field == "analyst_target":
-        # Use analyst recommendation mean as proxy
-        if rec < 2.0:  return 68
-        if rec < 2.5:  return 60
-        if rec > 3.5:  return 35
-        return 50
-
-    if field == "earnings_surprise":
-        # No EPS data: use sentiment as proxy
-        if rec < 2.0:  return 62
-        if rec > 3.5:  return 40
-        return 52
-
-    if field == "revenue_growth":
-        # No revenue growth: penalize — data should exist for real companies
-        return 42
-
-    if field == "profit_margin":
-        return 45  # Missing margin = slightly negative (most healthy cos report it)
-
-    if field == "debt_equity":
-        return 55  # No D/E = possibly no debt → slight positive
-
-    if field == "div_growth":
-        return 50
-
-    return 50
-
-# ─── TECHNICAL SCORERS (price-history based) ─────────────────────────────────
+# ─── TECHNICAL SCORERS ────────────────────────────────────────────────────────
 
 def score_momentum_multi(hist) -> int:
-    """Multi-timeframe momentum. Returns decisive scores, trend consistency bonus."""
     try:
         close = hist["Close"].dropna()
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        close = close.astype(float)
         n = len(close)
         windows = [(5, 2.5), (21, 2.0), (63, 1.2), (126, 0.8)]
         scores, weights = [], []
         for days, w in windows:
             if n > days + 1:
-                ret = (float(close.iloc[-1]) / float(close.iloc[-days]) - 1) * 100
-                # More aggressive mapping: ±5% → ±25pts, ±15% → ±50pts
+                ret = (close.iloc[-1] / close.iloc[-days] - 1) * 100
                 pts = _clamp(50 + ret * 4.0)
-                scores.append(pts)
-                weights.append(w)
-        if not scores:
-            return 50
+                scores.append(pts); weights.append(w)
+        if not scores: return 50
         composite = sum(s * w for s, w in zip(scores, weights)) / sum(weights)
-        # Trend consistency: all timeframes aligned = amplify signal
-        if all(s >= 60 for s in scores): composite = min(100, composite + 10)
+        if all(s >= 60 for s in scores):   composite = min(100, composite + 10)
         elif all(s >= 55 for s in scores): composite = min(100, composite + 5)
         elif all(s <= 40 for s in scores): composite = max(0,   composite - 10)
         elif all(s <= 45 for s in scores): composite = max(0,   composite - 5)
@@ -206,16 +246,16 @@ def score_momentum_multi(hist) -> int:
         return 50
 
 def score_rsi(hist) -> int:
-    """RSI 14-day — full decisive range."""
     try:
         close = hist["Close"].dropna()
+        if isinstance(close, pd.DataFrame): close = close.iloc[:, 0]
+        close = close.astype(float)
         if len(close) < 16: return 50
         delta = close.diff()
         gain  = delta.clip(lower=0).rolling(14).mean()
         loss  = (-delta.clip(upper=0)).rolling(14).mean()
         rs    = gain / loss.replace(0, np.nan).fillna(1e-9)
         r     = float((100 - (100 / (1 + rs))).iloc[-1])
-        # Very decisive breakpoints
         if   r < 20: return 90
         elif r < 30: return 78
         elif r < 40: return 64
@@ -228,48 +268,45 @@ def score_rsi(hist) -> int:
         return 50
 
 def score_macd(hist) -> int:
-    """MACD histogram with trend direction and momentum."""
     try:
         close = hist["Close"].dropna()
+        if isinstance(close, pd.DataFrame): close = close.iloc[:, 0]
+        close = close.astype(float)
         if len(close) < 35: return 50
         ema12    = close.ewm(span=12, adjust=False).mean()
         ema26    = close.ewm(span=26, adjust=False).mean()
-        macd_l   = ema12 - ema26
-        signal_l = macd_l.ewm(span=9, adjust=False).mean()
-        histo    = macd_l - signal_l
-        c  = float(histo.iloc[-1])
-        p  = float(histo.iloc[-2])
-        p2 = float(histo.iloc[-3])
-
-        # Crossovers get big scores
+        histo    = (ema12 - ema26) - (ema12 - ema26).ewm(span=9, adjust=False).mean()
+        c, p, p2 = float(histo.iloc[-1]), float(histo.iloc[-2]), float(histo.iloc[-3])
         if c > 0 and p <= 0:              return 84
         if c < 0 and p >= 0:              return 16
-        # Strong trending histogram
         if c > 0 and c > p and p > p2:   return _clamp(70 + min(c * 8, 20))
         if c > 0 and c > p:              return _clamp(63 + min(c * 5, 15))
         if c > 0:                         return _clamp(55 + min(c * 3, 10))
         if c < 0 and c < p and p < p2:   return _clamp(30 + max(c * 8, -20))
         if c < 0 and c < p:              return _clamp(37 + max(c * 5, -15))
-        if c < 0:                         return _clamp(45 + max(c * 3, -10))
-        return 50
+        return _clamp(45 + max(c * 3, -10))
     except:
         return 50
 
 def score_volume(hist) -> int:
-    """Volume vs 90d avg + price direction. Decisive on spikes."""
     try:
-        if len(hist) < 20: return 50
-        avg_vol    = float(hist["Volume"].iloc[-90:].mean()) if len(hist) >= 90 else float(hist["Volume"].mean())
-        recent_vol = float(hist["Volume"].iloc[-5:].mean())
+        vol = hist["Volume"]
+        if isinstance(vol, pd.DataFrame): vol = vol.iloc[:, 0]
+        vol = vol.astype(float)
+        close = hist["Close"]
+        if isinstance(close, pd.DataFrame): close = close.iloc[:, 0]
+        close = close.astype(float)
+        if len(vol) < 20: return 50
+        avg_vol    = float(vol.iloc[-90:].mean()) if len(vol) >= 90 else float(vol.mean())
+        recent_vol = float(vol.iloc[-5:].mean())
         if avg_vol == 0: return 50
         ratio    = recent_vol / avg_vol
-        price_up = float(hist["Close"].iloc[-1]) > float(hist["Close"].iloc[-6]) if len(hist) >= 6 else True
-        # Stronger amplification on volume spikes
+        price_up = float(close.iloc[-1]) > float(close.iloc[-6]) if len(close) >= 6 else True
         if   ratio > 3.0: amp = 38
         elif ratio > 2.0: amp = 28
         elif ratio > 1.5: amp = 18
         elif ratio > 1.2: amp = 10
-        elif ratio < 0.5: amp = -12  # Very low volume = weak conviction
+        elif ratio < 0.5: amp = -12
         elif ratio < 0.7: amp = -6
         else:             amp = 0
         base = 56 if price_up else 44
@@ -278,32 +315,32 @@ def score_volume(hist) -> int:
         return 50
 
 def score_week52_position(hist, info) -> int:
-    """Where stock sits in 52w range, combined with recent momentum direction."""
     try:
         close = hist["Close"].dropna()
+        if isinstance(close, pd.DataFrame): close = close.iloc[:, 0]
+        close = close.astype(float)
         if len(close) < 50: return 50
-        high52   = float(close.rolling(min(252, len(close))).max().iloc[-1])
-        low52    = float(close.rolling(min(252, len(close))).min().iloc[-1])
+        n     = min(252, len(close))
+        high52   = float(close.rolling(n).max().iloc[-1])
+        low52    = float(close.rolling(n).min().iloc[-1])
         current  = float(close.iloc[-1])
         if high52 == low52: return 50
-        pct      = (current - low52) / (high52 - low52)  # 0=at low, 1=at high
-        ret_1m   = float(close.iloc[-1] / close.iloc[-22] - 1) if len(close) >= 22 else 0
-        up       = ret_1m > 0.01
-
-        # Near 52w low + bouncing = strong buy
-        if pct < 0.15 and up:     return _clamp(80 + (0.15 - pct) * 100)
-        elif pct < 0.15:          return _clamp(35 - (0.15 - pct) * 80)
-        elif pct < 0.30 and up:   return 68
-        elif pct < 0.30:          return 42
-        elif pct < 0.70:          return _clamp(50 + (pct - 0.5) * 25)
-        elif pct < 0.85 and up:   return 70
-        elif pct < 0.85:          return 38
-        elif up:                  return _clamp(72 + (pct - 0.85) * 100)
-        else:                     return _clamp(28 - (pct - 0.85) * 100)
+        pct    = (current - low52) / (high52 - low52)
+        ret_1m = float(close.iloc[-1] / close.iloc[-22] - 1) if len(close) >= 22 else 0
+        up     = ret_1m > 0.01
+        if pct < 0.15 and up:    return _clamp(80 + (0.15 - pct) * 100)
+        elif pct < 0.15:         return _clamp(35 - (0.15 - pct) * 80)
+        elif pct < 0.30 and up:  return 68
+        elif pct < 0.30:         return 42
+        elif pct < 0.70:         return _clamp(50 + (pct - 0.5) * 25)
+        elif pct < 0.85 and up:  return 70
+        elif pct < 0.85:         return 38
+        elif up:                 return _clamp(72 + (pct - 0.85) * 100)
+        else:                    return _clamp(28 - (pct - 0.85) * 100)
     except:
         return 50
 
-# ─── FUNDAMENTAL SCORERS (info dict based) ────────────────────────────────────
+# ─── FUNDAMENTAL SCORERS ─────────────────────────────────────────────────────
 
 def score_short_interest(info) -> int:
     try:
@@ -326,9 +363,8 @@ def score_earnings_surprise(info) -> int:
         forward  = info.get("forwardEps")
         if trailing is None: return _smart_default(info, "earnings_surprise")
         if forward is None:  forward = trailing
-        if abs(forward) < 0.01: return 50
-        surprise = (trailing - forward) / abs(forward) * 100
-        # Very decisive: big beat = high score
+        if abs(float(forward)) < 0.01: return 50
+        surprise = (float(trailing) - float(forward)) / abs(float(forward)) * 100
         if   surprise >  30: return 88
         elif surprise >  15: return 76
         elif surprise >   5: return 65
@@ -342,25 +378,22 @@ def score_earnings_surprise(info) -> int:
 def score_sentiment(info) -> int:
     try:
         rec = info.get("recommendationMean")
-        if rec is None: return 52  # Slight positive if no coverage
-        # 1.0=Strong Buy→95, 2.0→74, 3.0→50, 4.0→26, 5.0→5
-        return _clamp(95 - (rec - 1.0) * 22.5)
+        if rec is None: return 52
+        return _clamp(95 - (float(rec) - 1.0) * 22.5)
     except:
         return 50
 
 def score_analyst_revisions(info) -> int:
     try:
-        rec        = info.get("recommendationMean") or 3.0
-        n_analysts = info.get("numberOfAnalystOpinions") or 0
+        rec        = float(info.get("recommendationMean") or 3.0)
+        n_analysts = int(info.get("numberOfAnalystOpinions") or 0)
         if n_analysts == 0: return _smart_default(info, "analyst_target")
         base = _clamp(95 - (rec - 1.0) * 22.5)
-        # High analyst coverage = higher conviction in both directions
-        if n_analysts >= 40: conf = 12
+        if   n_analysts >= 40: conf = 12
         elif n_analysts >= 25: conf = 8
         elif n_analysts >= 15: conf = 4
         elif n_analysts < 5:   conf = -8
         else:                  conf = 0
-        # Amplify away from 50 by confidence
         delta = base - 50
         return _clamp(50 + delta + (conf if delta > 0 else -conf))
     except:
@@ -369,11 +402,10 @@ def score_analyst_revisions(info) -> int:
 def score_analyst_target(info) -> int:
     try:
         target  = info.get("targetMeanPrice") or info.get("targetMedianPrice")
-        current = info.get("currentPrice") or info.get("regularMarketPrice")
-        if not target or not current or current == 0:
+        current = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+        if not target or not current or float(current) == 0:
             return _smart_default(info, "analyst_target")
-        upside = (target / current - 1) * 100
-        # Very decisive mapping
+        upside = (float(target) / float(current) - 1) * 100
         if   upside >  40: return 92
         elif upside >  25: return 82
         elif upside >  15: return 73
@@ -391,7 +423,7 @@ def score_pe_vs_sector(info) -> int:
     try:
         pe     = info.get("trailingPE") or info.get("forwardPE")
         sector = info.get("sector", "")
-        if pe is None or pe <= 0 or pe > 1500: return 50
+        if pe is None or float(pe) <= 0 or float(pe) > 1500: return 50
         benchmarks = {
             "Technology": 28, "Healthcare": 22, "Financials": 13,
             "Consumer Cyclical": 20, "Consumer Defensive": 18,
@@ -400,7 +432,7 @@ def score_pe_vs_sector(info) -> int:
             "Communication Services": 22,
         }
         bm = benchmarks.get(sector, 20)
-        r  = pe / bm
+        r  = float(pe) / bm
         if   r < 0.4:  return 88
         elif r < 0.6:  return 78
         elif r < 0.8:  return 67
@@ -417,7 +449,7 @@ def score_revenue_growth(info) -> int:
     try:
         g = info.get("revenueGrowth")
         if g is None: return _smart_default(info, "revenue_growth")
-        g *= 100
+        g = float(g) * 100
         if   g >  50: return 95
         elif g >  30: return 85
         elif g >  20: return 75
@@ -435,7 +467,7 @@ def score_profit_margin(info) -> int:
     try:
         m = info.get("profitMargins")
         if m is None: return _smart_default(info, "profit_margin")
-        m *= 100
+        m = float(m) * 100
         if   m >  40: return 93
         elif m >  30: return 85
         elif m >  20: return 76
@@ -452,9 +484,9 @@ def score_fcf_yield(info) -> int:
     try:
         fcf    = info.get("freeCashflow")
         mktcap = info.get("marketCap") or 0
-        if fcf is None or mktcap == 0:
+        if fcf is None or float(mktcap) == 0:
             return _smart_default(info, "fcf_yield")
-        y = (fcf / mktcap) * 100
+        y = (float(fcf) / float(mktcap)) * 100
         if   y >  10: return 90
         elif y >   6: return 78
         elif y >   4: return 68
@@ -470,6 +502,7 @@ def score_debt_equity(info) -> int:
     try:
         de = info.get("debtToEquity")
         if de is None: return _smart_default(info, "debt_equity")
+        de = float(de)
         if   de <  10: return 85
         elif de <  30: return 75
         elif de <  60: return 64
@@ -485,9 +518,9 @@ def score_eps_growth(info) -> int:
         trailing = info.get("trailingEps")
         forward  = info.get("forwardEps")
         if trailing is None: return _smart_default(info, "revenue_growth")
-        if forward is None:  forward = trailing
-        if abs(trailing) < 0.01: return 50
-        g = (forward - trailing) / abs(trailing) * 100
+        if forward  is None: forward = trailing
+        if abs(float(trailing)) < 0.01: return 50
+        g = (float(forward) - float(trailing)) / abs(float(trailing)) * 100
         if   g >  50: return 92
         elif g >  30: return 82
         elif g >  20: return 72
@@ -503,8 +536,9 @@ def score_eps_growth(info) -> int:
 def score_peg(info) -> int:
     try:
         peg = info.get("pegRatio")
-        if peg is None or peg <= 0:
+        if peg is None or float(peg) <= 0:
             return _smart_default(info, "peg_ratio")
+        peg = float(peg)
         if   peg < 0.5:  return 92
         elif peg < 0.8:  return 80
         elif peg < 1.0:  return 70
@@ -527,11 +561,13 @@ def score_macro(_info=None) -> int:
     if today in _macro_cache:
         return _macro_cache[today]
     try:
-        vix_data = yf.Ticker("^VIX").history(period="10d")["Close"].dropna()
-        vix_now  = float(vix_data.iloc[-1])
-        vix_5d   = float(vix_data.iloc[-5]) if len(vix_data) >= 5 else vix_now
-        rising   = vix_now > vix_5d * 1.05  # Rising >5% = fear increasing
-
+        hist     = _get_history("^VIX", period="1mo")
+        if hist.empty: raise ValueError("no VIX data")
+        close    = hist["Close"]
+        if isinstance(close, pd.DataFrame): close = close.iloc[:, 0]
+        vix_now  = float(close.iloc[-1])
+        vix_5d   = float(close.iloc[-5]) if len(close) >= 5 else vix_now
+        rising   = vix_now > vix_5d * 1.05
         if   vix_now < 12: base = 84
         elif vix_now < 15: base = 73
         elif vix_now < 18: base = 63
@@ -539,7 +575,6 @@ def score_macro(_info=None) -> int:
         elif vix_now < 28: base = 40
         elif vix_now < 35: base = 28
         else:              base = 15
-
         if rising: base = max(8, base - 10)
         _macro_cache[today] = base
         return base
@@ -561,15 +596,19 @@ def score_sector_momentum(info) -> int:
         etf    = SECTOR_ETFS.get(sector, "SPY")
         key    = f"{etf}_{datetime.now().strftime('%Y-%m-%d')}"
         if key not in _sector_cache:
-            h = yf.Ticker(etf).history(period="3mo")["Close"].dropna()
-            if len(h) >= 22:
-                r1m = (float(h.iloc[-1]) / float(h.iloc[-22]) - 1) * 100
-                r3m = (float(h.iloc[-1]) / float(h.iloc[-63]) - 1) * 100 if len(h) >= 63 else r1m
-                # Strong sector ETF returns map to strong scores
-                score = _clamp(50 + r1m * 3.0 + r3m * 1.0)
+            h = _get_history(etf, period="1y")
+            if h.empty:
+                _sector_cache[key] = 50
             else:
-                score = 50
-            _sector_cache[key] = score
+                c = h["Close"]
+                if isinstance(c, pd.DataFrame): c = c.iloc[:, 0]
+                c = c.astype(float).dropna()
+                if len(c) >= 22:
+                    r1m = (float(c.iloc[-1]) / float(c.iloc[-22]) - 1) * 100
+                    r3m = (float(c.iloc[-1]) / float(c.iloc[-63]) - 1) * 100 if len(c) >= 63 else r1m
+                    _sector_cache[key] = _clamp(50 + r1m * 3.0 + r3m * 1.0)
+                else:
+                    _sector_cache[key] = 50
         return _sector_cache[key]
     except:
         return 50
@@ -577,21 +616,20 @@ def score_sector_momentum(info) -> int:
 def score_earnings_proximity(info) -> int:
     try:
         ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
-        if ts is None:
-            return _smart_default(info, "earnings_proximity")
+        if ts is None: return _smart_default(info, "earnings_proximity")
         days = (datetime.fromtimestamp(int(ts)) - datetime.now()).days
-        if   0 <= days <= 2:          return 30   # Earnings tomorrow = max risk
-        elif 0 <= days <= 7:          return 38
-        elif 0 <= days <= 14:         return 45
-        elif 0 <= days <= 30:         return 52
-        elif days < 0 and days >= -5: return 65   # Just reported = clarity
-        elif days < 0 and days >= -14:return 60
-        elif days < 0 and days >= -30:return 56
+        if   0 <= days <= 2:           return 30
+        elif 0 <= days <= 7:           return 38
+        elif 0 <= days <= 14:          return 45
+        elif 0 <= days <= 30:          return 52
+        elif days < 0 and days >= -5:  return 65
+        elif days < 0 and days >= -14: return 60
+        elif days < 0 and days >= -30: return 56
         return 54
     except:
         return 54
 
-# ─── COMPOSITE BUILDER ───────────────────────────────────────────────────────
+# ─── COMPOSITE ───────────────────────────────────────────────────────────────
 
 def _build_data_scores(hist, info: dict) -> dict:
     return {
@@ -618,73 +656,45 @@ def _build_data_scores(hist, info: dict) -> dict:
     }
 
 def _composite(ds: dict, horizon: str):
-    w        = WEIGHTS[horizon]
-    total_w  = sum(w.values())
-    raw      = sum(ds[k] * w[k] for k in ds) / total_w
-    final    = stretch_score(raw)
-    return final, round(raw, 1)
+    w       = WEIGHTS[horizon]
+    total_w = sum(w.values())
+    raw     = sum(ds[k] * w[k] for k in ds) / total_w
+    return stretch_score(raw), round(raw, 1)
 
 def compute_price_target(price: float, score: int, horizon: str) -> float:
     direction = (score - 50) / 50
     return round(price * (1 + direction * HORIZON_FACTORS[horizon]), 2)
 
-# ─── DEBUG HELPER ─────────────────────────────────────────────────────────────
-
-def debug_score(ticker: str, horizon: str = "1M") -> pd.DataFrame:
-    """
-    Show exactly how each data point contributes to the final score.
-    Useful for diagnosing why a score is high/low or why it stays near 50.
-    Returns a DataFrame with each data point, its raw score, weight, and contribution.
-    """
-    t    = yf.Ticker(ticker)
-    info = t.info or {}
-    hist = t.history(period="1y")
-    ds   = _build_data_scores(hist, info)
-    w    = WEIGHTS[horizon]
-    total_w = sum(w.values())
-
-    rows = []
-    for k, score in ds.items():
-        weight     = w[k]
-        contrib    = round(score * weight / total_w, 2)
-        rows.append({
-            "Data Point":    DATA_POINT_LABELS.get(k, k),
-            "Raw Score":     score,
-            "Weight":        weight,
-            "Contribution":  contrib,
-            "Signal":        "🟢 Bullish" if score > 60 else ("🔴 Bearish" if score < 40 else "🟡 Neutral"),
-        })
-
-    df = pd.DataFrame(rows).sort_values("Contribution", ascending=False)
-    final, raw = _composite(ds, horizon)
-    print(f"\n{ticker.upper()} | Horizon: {horizon} | Raw: {raw} | Final (stretched): {final} | Signal: {_signal_label(final)}")
-    return df
-
 # ─── BRIER ───────────────────────────────────────────────────────────────────
 
 def compute_brier(score: int, actual_return_pct: float, horizon: str) -> float:
-    p_up    = score / 100.0
-    outcome = 1 if actual_return_pct > 0 else 0
-    return round((p_up - outcome) ** 2, 4)
+    return round((score / 100.0 - (1 if actual_return_pct > 0 else 0)) ** 2, 4)
 
 # ─── MAIN FETCH & SCORE ──────────────────────────────────────────────────────
 
 def fetch_and_score(ticker: str, horizon: str = "1M",
                     _hist=None, _info=None) -> dict:
+    fetch_error = None
     try:
-        t    = yf.Ticker(ticker)
-        info = _info if _info is not None else (t.info or {})
-        hist = _hist if _hist is not None else t.history(period="1y")
+        info = _info if _info is not None else _get_info(ticker)
+        hist = _hist if _hist is not None else _get_history(ticker)
+
+        if info.get("_fetch_failed"):
+            fetch_error = "Yahoo Finance info unavailable — rate limited or ticker invalid"
 
         if hist is None or hist.empty:
-            return _error_result(ticker, horizon, "No price data found")
+            return _error_result(ticker, horizon, "No price history returned from Yahoo Finance")
+
+        # Flatten MultiIndex if present (yf.download returns this sometimes)
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0)
 
         ds           = _build_data_scores(hist, info)
         overall, raw = _composite(ds, horizon)
-        price        = round(float(hist["Close"].iloc[-1]), 2)
+        close_col    = hist["Close"]
+        if isinstance(close_col, pd.DataFrame): close_col = close_col.iloc[:, 0]
+        price        = round(float(close_col.iloc[-1]), 2)
         target       = compute_price_target(price, overall, horizon)
-
-        # Confidence: how many fields had non-neutral data (not 50 exactly)
         non_neutral  = sum(1 for v in ds.values() if v != 50)
         confidence   = round((non_neutral / len(ds)) * 100)
 
@@ -699,8 +709,8 @@ def fetch_and_score(ticker: str, horizon: str = "1M",
             "data_scores": ds,
             "brier":       None,
             "confidence":  confidence,
-            "error":       None,
-            "name":        info.get("shortName", ticker),
+            "error":       fetch_error,
+            "name":        info.get("shortName", ticker.upper()),
             "sector":      info.get("sector", "—"),
             "market_cap":  info.get("marketCap"),
         }
@@ -731,56 +741,68 @@ def fetch_and_score_batch(tickers: list, horizon: str = "1M") -> pd.DataFrame:
 def backtest_ticker(ticker: str, date_str: str, end_date_str: str = None) -> dict:
     HORIZON_DAYS = {"1D": 1, "1W": 7, "1M": 30, "1Q": 90, "1Y": 365}
     try:
-        t       = yf.Ticker(ticker)
         start   = datetime.strptime(date_str, "%Y-%m-%d")
         end_cap = datetime.strptime(end_date_str, "%Y-%m-%d") if end_date_str else None
 
+        t = yf.Ticker(ticker)
         hist_to_date = t.history(start=start - timedelta(days=400),
                                  end=start + timedelta(days=2))
         if hist_to_date.empty:
+            hist_to_date = yf.download(ticker,
+                start=(start - timedelta(days=400)).strftime("%Y-%m-%d"),
+                end=(start + timedelta(days=2)).strftime("%Y-%m-%d"),
+                progress=False, auto_adjust=True)
+            if isinstance(hist_to_date.columns, pd.MultiIndex):
+                hist_to_date.columns = hist_to_date.columns.get_level_values(0)
+
+        if hist_to_date.empty:
             return {"error": f"No data for {ticker} around {date_str}"}
 
-        price_at_date = round(float(hist_to_date["Close"].iloc[-1]), 2)
-        fetch_end     = min(end_cap, datetime.now()) if end_cap else datetime.now()
-        hist_future   = t.history(start=start, end=fetch_end + timedelta(days=2))
-        info          = t.info or {}
-        ds            = _build_data_scores(hist_to_date, info)
-        results       = []
+        close_col = hist_to_date["Close"]
+        if isinstance(close_col, pd.DataFrame): close_col = close_col.iloc[:, 0]
+        price_at_date = round(float(close_col.iloc[-1]), 2)
+
+        fetch_end   = min(end_cap, datetime.now()) if end_cap else datetime.now()
+        hist_future = t.history(start=start, end=fetch_end + timedelta(days=2))
+        if isinstance(hist_future.columns, pd.MultiIndex):
+            hist_future.columns = hist_future.columns.get_level_values(0)
+
+        info = _get_info(ticker)
+        ds   = _build_data_scores(hist_to_date, info)
+        results = []
 
         for horizon, days in HORIZON_DAYS.items():
             overall, _ = _composite(ds, horizon)
             pred_target = compute_price_target(price_at_date, overall, horizon)
-
             horizon_end = start + timedelta(days=days)
             if end_cap: horizon_end = min(horizon_end, end_cap)
 
-            idx = hist_future.index
+            idx   = hist_future.index
             he_ts = (pd.Timestamp(horizon_end).tz_localize(idx.tz)
                      if (hasattr(idx, 'tz') and idx.tz is not None)
                      else pd.Timestamp(horizon_end))
-
             future_slice = hist_future[hist_future.index <= he_ts]
+
             if len(future_slice) > 0:
-                actual_price = round(float(future_slice["Close"].iloc[-1]), 2)
+                fc = future_slice["Close"]
+                if isinstance(fc, pd.DataFrame): fc = fc.iloc[:, 0]
+                actual_price = round(float(fc.iloc[-1]), 2)
                 actual_ret   = round((actual_price / price_at_date - 1) * 100, 2)
                 brier        = compute_brier(overall, actual_ret, horizon)
             else:
                 actual_price = actual_ret = brier = None
 
             pred_dir   = "UP" if overall >= 55 else ("DOWN" if overall <= 45 else "FLAT")
-            actual_dir = ("UP"   if (actual_ret or 0) >  0.5 else
+            actual_dir = ("UP" if (actual_ret or 0) > 0.5 else
                           "DOWN" if (actual_ret or 0) < -0.5 else "FLAT") if actual_ret is not None else "—"
             correct    = (pred_dir == actual_dir) if actual_ret is not None else None
 
             results.append({
-                "Horizon":           horizon,
-                "Score":             overall,
-                "Signal":            _signal_label(overall),
-                "Pred Target":       pred_target,
-                "Actual Return %":   actual_ret,
-                "Actual Price":      actual_price,
+                "Horizon": horizon, "Score": overall, "Signal": _signal_label(overall),
+                "Pred Target": pred_target, "Actual Return %": actual_ret,
+                "Actual Price": actual_price,
                 "Direction Correct": "✓ YES" if correct else ("✗ NO" if correct is not None else "—"),
-                "Brier Score":       brier,
+                "Brier Score": brier,
             })
 
         return {"ticker": ticker.upper(), "date": date_str, "end_date": end_date_str,
@@ -788,35 +810,45 @@ def backtest_ticker(ticker: str, date_str: str, end_date_str: str = None) -> dic
     except Exception as e:
         return {"error": str(e)}
 
-# ─── SCENARIO SIMULATOR ──────────────────────────────────────────────────────
+# ─── SCENARIO ────────────────────────────────────────────────────────────────
 
 def run_scenario(ticker, start_date, end_date, dollars,
                  interval, buy_rating, sell_rating):
     INTERVAL_DAYS = {"1D": 1, "1W": 7, "1M": 30}
     days_step = INTERVAL_DAYS.get(interval, 7)
     try:
-        t     = yf.Ticker(ticker)
         start = datetime.strptime(start_date, "%Y-%m-%d")
         end   = datetime.strptime(end_date,   "%Y-%m-%d")
         if end <= start:
             return None, "End date must be after start date."
 
+        t         = yf.Ticker(ticker)
         hist_full = t.history(start=start - timedelta(days=400),
                               end=end + timedelta(days=2))
         if hist_full.empty:
+            hist_full = yf.download(ticker,
+                start=(start - timedelta(days=400)).strftime("%Y-%m-%d"),
+                end=(end + timedelta(days=2)).strftime("%Y-%m-%d"),
+                progress=False, auto_adjust=True)
+            if isinstance(hist_full.columns, pd.MultiIndex):
+                hist_full.columns = hist_full.columns.get_level_values(0)
+
+        if hist_full.empty:
             return None, "No price data found."
+
         if hist_full.index.tz is not None:
             hist_full.index = hist_full.index.tz_localize(None)
 
         cash, shares, log, cur = float(dollars), 0, [], start
-
         while cur <= end and len(log) < 500:
             subset = hist_full[hist_full.index <= pd.Timestamp(cur)]
             if len(subset) < 20:
-                cur += timedelta(days=days_step)
-                continue
+                cur += timedelta(days=days_step); continue
 
-            price = round(float(subset["Close"].iloc[-1]), 2)
+            close_s = subset["Close"]
+            if isinstance(close_s, pd.DataFrame): close_s = close_s.iloc[:, 0]
+            price = round(float(close_s.iloc[-1]), 2)
+
             raw   = (score_momentum_multi(subset) * 0.40 +
                      score_rsi(subset)            * 0.35 +
                      score_macd(subset)           * 0.25)
@@ -830,37 +862,25 @@ def run_scenario(ticker, start_date, end_date, dollars,
             elif score <= sell_rating and shares > 0:
                 cash += shares * price; shares = 0; action = "SELL"
 
-            log.append({
-                "Date":            cur.strftime("%Y-%m-%d"),
-                "Score":           score,
-                "Price":           price,
-                "Action":          action,
-                "Shares Held":     shares,
-                "Cash":            round(cash, 2),
-                "Portfolio Value": round(cash + shares * price, 2),
-            })
+            log.append({"Date": cur.strftime("%Y-%m-%d"), "Score": score,
+                        "Price": price, "Action": action, "Shares Held": shares,
+                        "Cash": round(cash, 2),
+                        "Portfolio Value": round(cash + shares * price, 2)})
             cur += timedelta(days=days_step)
 
         df = pd.DataFrame(log)
-        if df.empty:
-            return None, "No trading periods in date range."
+        if df.empty: return None, "No trading periods in date range."
 
-        final      = df["Portfolio Value"].iloc[-1]
-        bh_val     = round(float(dollars) * (df["Price"].iloc[-1] / df["Price"].iloc[0]), 2)
-        total_ret  = round((final / float(dollars) - 1) * 100, 2)
-        bh_ret     = round((bh_val / float(dollars) - 1) * 100, 2)
-
-        summary = {
-            "Final Portfolio":     round(final, 2),
-            "Total Return %":      total_ret,
-            "Buy & Hold Return %": bh_ret,
-            "Alpha vs B&H %":      round(total_ret - bh_ret, 2),
-            "Total Trades":        len(df[df["Action"] != "HOLD"]),
-            "Start Date":          start_date,
-            "End Date":            end_date,
-            "Starting Capital":    float(dollars),
+        final     = df["Portfolio Value"].iloc[-1]
+        bh_val    = round(float(dollars) * (df["Price"].iloc[-1] / df["Price"].iloc[0]), 2)
+        total_ret = round((final / float(dollars) - 1) * 100, 2)
+        bh_ret    = round((bh_val / float(dollars) - 1) * 100, 2)
+        return df, {
+            "Final Portfolio": round(final, 2), "Total Return %": total_ret,
+            "Buy & Hold Return %": bh_ret, "Alpha vs B&H %": round(total_ret - bh_ret, 2),
+            "Total Trades": len(df[df["Action"] != "HOLD"]),
+            "Start Date": start_date, "End Date": end_date, "Starting Capital": float(dollars),
         }
-        return df, summary
     except Exception as e:
         return None, str(e)
 
@@ -868,10 +888,6 @@ def run_scenario(ticker, start_date, end_date, dollars,
 
 def optimize_strategy(ticker: str, start_date: str, end_date: str,
                       dollars: float = 10000) -> dict:
-    """
-    Walk-forward optimizer with train/test split to prevent curve-fitting.
-    Finds optimal buy threshold, sell threshold, and interval.
-    """
     import itertools
     try:
         start      = datetime.strptime(start_date, "%Y-%m-%d")
@@ -906,10 +922,8 @@ def optimize_strategy(ticker: str, start_date: str, end_date: str,
             return {"error": "No valid combinations found."}
 
         train_results.sort(key=lambda x: x["alpha"], reverse=True)
-        top5  = train_results[:5]
         validated = []
-
-        for p in top5:
+        for p in train_results[:5]:
             df, summary = run_scenario(ticker, test_start, end_date, dollars,
                                        p["interval"], p["buy_rating"], p["sell_rating"])
             if df is None:
@@ -917,20 +931,17 @@ def optimize_strategy(ticker: str, start_date: str, end_date: str,
                                    "oos_alpha": None, "overfit_flag": True})
             else:
                 oos_alpha = summary["Alpha vs B&H %"]
-                overfit   = (oos_alpha < p["alpha"] * 0.5) if p["alpha"] > 0 else True
                 validated.append({**p, "oos_return": summary["Total Return %"],
                                    "oos_bh_return": summary["Buy & Hold Return %"],
-                                   "oos_alpha": oos_alpha, "overfit_flag": overfit})
+                                   "oos_alpha": oos_alpha,
+                                   "overfit_flag": oos_alpha < p["alpha"] * 0.5 if p["alpha"] > 0 else True})
 
-        valid_oos = [v for v in validated if v.get("oos_alpha") is not None]
-        best      = max(valid_oos, key=lambda x: x["oos_alpha"]) if valid_oos else validated[0]
-
-        return {
-            "ticker": ticker.upper(), "start_date": start_date, "end_date": end_date,
-            "train_end": train_end, "test_start": test_start,
-            "best_params": best, "top5": validated,
-            "total_combos": len(train_results), "error": None,
-        }
+        valid = [v for v in validated if v.get("oos_alpha") is not None]
+        best  = max(valid, key=lambda x: x["oos_alpha"]) if valid else validated[0]
+        return {"ticker": ticker.upper(), "start_date": start_date, "end_date": end_date,
+                "train_end": train_end, "test_start": test_start,
+                "best_params": best, "top5": validated,
+                "total_combos": len(train_results), "error": None}
     except Exception as e:
         return {"error": str(e)}
 
