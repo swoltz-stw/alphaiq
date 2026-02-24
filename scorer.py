@@ -1289,3 +1289,76 @@ def _error_result(ticker, horizon, msg):
             "data_scores":{k:50 for k in DATA_POINT_LABELS},
             "category_scores":{},"brier":None,"confidence":0,
             "error":msg,"name":ticker,"sector":"—","market_cap":None,"is_etf":False}
+
+def predict_next_day_direction(ticker: str) -> dict:
+    """
+    High-level wrapper for your engine:
+    - Uses 1D horizon score
+    - Maps score to UP / DOWN / FLAT
+    - Computes a simple confidence based on distance from 50
+    """
+    res = fetch_and_score(ticker, "1D")
+    score = res["overall"]
+
+    # Direction mapping
+    if score >= 55:
+        direction = "UP"
+    elif score <= 45:
+        direction = "DOWN"
+    else:
+        direction = "FLAT"
+
+    # Distance-based confidence (simple but intuitive)
+    dist = abs(score - 50)  # 0–50
+    # Example: dist 5 → 55%, dist 10 → 60%, dist 25 → 75%, cap at 90
+    confidence = max(50, min(90, 50 + int(dist)))
+
+    return {
+        "ticker": res["ticker"],
+        "direction": direction,
+        "confidence": confidence,
+        "score": score,
+        "signal": res["signal"],
+        "price": res.get("price"),
+        "target": res.get("target"),
+        "horizon": "1D",
+        "raw_score": res.get("raw_score"),
+        "data_confidence": res.get("confidence"),  # % of fields available
+        "error": res.get("error"),
+    }
+
+def predict_market_next_day(index_key: str = "S&P 500") -> dict:
+    """
+    Uses the Market Probability engine and maps to UP / DOWN / FLAT for the index ETF.
+    """
+    res = score_market_probability(index_key)
+    if res.get("error"):
+        return {**res, "direction": None, "confidence": 0}
+
+    score = res["overall"]
+
+    if score >= 55:
+        direction = "UP"
+    elif score <= 45:
+        direction = "DOWN"
+        # Note: for market, you might want a wider neutral band (e.g. 47–53)
+    else:
+        direction = "FLAT"
+
+    dist = abs(score - 50)
+    confidence = max(50, min(90, 50 + int(dist)))
+
+    return {
+        "index": res["index"],
+        "index_name": res["index_name"],
+        "etf": res["etf"],
+        "direction": direction,
+        "confidence": confidence,
+        "score": score,
+        "signal": res["signal"],
+        "price": res.get("etf_price"),
+        "targets": res.get("targets"),
+        "raw_score": res.get("raw_score"),
+        "timestamp": res.get("timestamp"),
+        "error": None,
+    }
