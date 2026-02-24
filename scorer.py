@@ -206,6 +206,51 @@ WEIGHTS = {h: {k: POINT_WEIGHTS[k] for k in DATA_POINT_LABELS}
 
 HORIZON_FACTORS = {"1D": 0.006, "1W": 0.025, "1M": 0.08, "1Q": 0.18, "1Y": 0.42}
 
+# -----------------------------------------------------------------------------
+# Direction confidence calibration (universal, across all tickers)
+# -----------------------------------------------------------------------------
+# These values are a *starting point*. To fully calibrate, you can:
+#  - run backtest_ticker() across many tickers and dates,
+#  - bucket scores into bands (e.g., 80–100, 70–79, etc.),
+#  - compute the actual % of times the direction was correct in each band,
+#  - and then plug those empirical hit rates into SCORE_CONFIDENCE_MAP below.
+#
+# For now, we use a conservative, monotonic mapping that reflects:
+# - higher scores → clearly higher confidence,
+# - low scores → some edge, but not exaggerated.
+# -----------------------------------------------------------------------------
+
+SCORE_CONFIDENCE_MAP = [
+    (90, 100, 85),  # very strong edge
+    (80, 89, 78),
+    (70, 79, 68),
+    (60, 69, 60),
+    (55, 59, 55),
+    (45, 54, 50),  # essentially coin-flip territory
+    (30, 44, 45),
+    (0, 29, 40),   # strong negative view, but still uncertainty
+]
+
+
+def calibrated_confidence(score: int) -> int:
+    """
+    Map a 0–100 AlphaIQ score to a probability-like confidence (%) that
+    the direction call (UP vs DOWN) will be correct.
+
+    This is a global (universal) calibration across all tickers. To refine,
+    recompute SCORE_CONFIDENCE_MAP using your backtest results.
+    """
+    try:
+        s = int(score)
+    except Exception:
+        return 50
+
+    for low, high, conf in SCORE_CONFIDENCE_MAP:
+        if low <= s <= high:
+            return conf
+
+    return 50
+
 # ─── UTILITIES ────────────────────────────────────────────────────────────────
 
 def stretch_score(raw: float) -> int:
