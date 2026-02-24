@@ -163,7 +163,7 @@ with st.sidebar:
     page = st.radio(
         "Navigate",
         ["◎  Evaluator", "⊞  Screener", "↺  Backtest", "⚙  Optimizer",
-         "🌐  Market Probability", "⬡  Methodology", "🔬  Diagnostics"],
+         "🌐  Market Probability", "🔮 Next Day Call", "⬡  Methodology", "🔬  Diagnostics"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -784,6 +784,125 @@ Use these settings as a starting point in the Scenario Simulator to explore furt
                                    f"optimizer_{opt_ticker}_{opt_start}_{opt_end}.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+from scorer import predict_next_day_direction, predict_market_next_day
+
+# ...
+
+elif page == "Call":
+    st.markdown(
+        '<h2 style="margin-bottom:0">🔮 Next Day Call</h2>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<p style="color:#6b7280;margin-top:0">'
+        'UP / DOWN prediction for tomorrow with confidence — for any ticker or major index.'
+        '</p>',
+        unsafe_allow_html=True,
+    )
+
+    st.info(
+        "These calls are based on the 1-day horizon of the AlphaIQ engine "
+        "and the Market Probability model. For educational use only — not financial advice."
+    )
+
+    stock_tab, market_tab = st.tabs(["📈 Single Ticker", "🌎 Market"])
+
+    # --- Single Ticker Call ---
+    with stock_tab:
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            tkr = st.text_input("Ticker", value="AAPL").upper().strip()
+        with col2:
+            run_stock = st.button("▶ Predict Tomorrow", type="primary")
+
+        if run_stock and tkr:
+            with st.spinner(f"Analyzing {tkr} for next-day direction..."):
+                res = predict_next_day_direction(tkr)
+
+            if res.get("error"):
+                st.error(f"Error: {res['error']}")
+            else:
+                direction = res["direction"]
+                conf = res["confidence"]
+                score = res["score"]
+                signal = res["signal"]
+                price = res.get("price")
+                target = res.get("target")
+                data_conf = res.get("data_confidence", 0)
+
+                arrow = "▲" if direction == "UP" else ("▼" if direction == "DOWN" else "▬")
+                dir_color = "#16a34a" if direction == "UP" else ("#dc2626" if direction == "DOWN" else "#6b7280")
+
+                st.markdown(
+                    f"""
+                    <div style="border-radius:12px;padding:16px;border:1px solid #e5e7eb;background:#f9fafb;">
+                        <div style="font-size:13px;color:#6b7280;">Tomorrow's Call for <b>{tkr}</b></div>
+                        <div style="font-size:28px;font-weight:600;color:{dir_color};margin-top:4px;">
+                            {arrow} {direction}
+                        </div>
+                        <div style="font-size:16px;color:#111827;margin-top:4px;">
+                            Confidence: <b>{conf}%</b> &nbsp;·&nbsp; Score: <b>{score}</b> ({signal})
+                        </div>
+                        <div style="font-size:13px;color:#6b7280;margin-top:6px;">
+                            Data completeness: {data_conf}% &nbsp;·&nbsp;
+                            Horizon: 1 day
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                if price:
+                    st.metric("Last Price", f"${price:,.2f}")
+                if price and target:
+                    delta_pct = round((target / price - 1) * 100, 1)
+                    st.metric(
+                        "1D Model Target (theoretical)",
+                        f"${target:,.2f}",
+                        delta=f"{delta_pct:+.1f}%",
+                    )
+
+    # --- Market Call ---
+    with market_tab:
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            idx = st.selectbox("Index", ["S&P 500", "DOW", "NASDAQ"], index=0)
+        with col2:
+            run_market = st.button("▶ Predict Market", type="primary")
+
+        if run_market:
+            with st.spinner(f"Analyzing {idx} for next-day direction..."):
+                res_m = predict_market_next_day(idx)
+
+            if res_m.get("error"):
+                st.error(f"Error: {res_m['error']}")
+            else:
+                direction = res_m["direction"]
+                conf = res_m["confidence"]
+                score = res_m["score"]
+                signal = res_m["signal"]
+                price = res_m.get("price")
+                arrow = "▲" if direction == "UP" else ("▼" if direction == "DOWN" else "▬")
+                dir_color = "#16a34a" if direction == "UP" else ("#dc2626" if direction == "DOWN" else "#6b7280")
+
+                st.markdown(
+                    f"""
+                    <div style="border-radius:12px;padding:16px;border:1px solid #e5e7eb;background:#f9fafb;">
+                        <div style="font-size:13px;color:#6b7280;">Tomorrow's Call for {res_m['index_name']} ({res_m['etf']})</div>
+                        <div style="font-size:28px;font-weight:600;color:{dir_color};margin-top:4px;">
+                            {arrow} {direction}
+                        </div>
+                        <div style="font-size:16px;color:#111827;margin-top:4px;">
+                            Confidence: <b>{conf}%</b> &nbsp;·&nbsp; Score: <b>{score}</b> ({signal})
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                if price:
+                    st.metric("ETF Price", f"${price:,.2f}")
+                    
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE 5 — MARKET PROBABILITY
 # ══════════════════════════════════════════════════════════════════════════════
